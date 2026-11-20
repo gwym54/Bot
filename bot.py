@@ -28,7 +28,7 @@ from datetime import date, datetime, timedelta, timezone
 import httpx
 import pyotp
 from urllib.parse import urlencode
-from telegram import (InlineKeyboardButton, InlineKeyboardMarkup,
+from telegram import (CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup,
                       ReplyKeyboardMarkup, Update)
 from telegram.ext import (ApplicationBuilder, CallbackQueryHandler,
                           CommandHandler, ContextTypes, MessageHandler, filters)
@@ -43,14 +43,14 @@ log = logging.getLogger("bot")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 # SMS_SOURCE=group : Teleroutex forwards SMS into a Telegram group/channel (SOURCE_GROUP_ID); bot reads it
 # SMS_SOURCE=api   : bot polls MESSAGES_URL instead
-SMS_SOURCE = os.environ.get("SMS_SOURCE", "api")
+SMS_SOURCE = os.environ.get("SMS_SOURCE", "group")
 SOURCE_GROUP_ID = int(os.environ.get("SOURCE_GROUP_ID", "0"))
 MESSAGES_URL = os.environ.get("MESSAGES_URL", "")
 # API mode (SMS_SOURCE=api): either set TELEROUTEX_API_KEY (recommended) or a full MESSAGES_URL
 TELEROUTEX_API_KEY = os.environ.get("TELEROUTEX_API_KEY", "").strip()
 TELEROUTEX_URL = os.environ.get("TELEROUTEX_URL", "https://server.teleroutex.com/api/message-data-record/viewstats")
 if SMS_SOURCE == "api" and not (MESSAGES_URL or TELEROUTEX_API_KEY):
-    raise SystemExit("API mode needs TELEROUTEX_API_KEY (or MESSAGES_URL). Get the key from Teleroutex panel.")
+    raise SystemExit("SMS_SOURCE=api needs TELEROUTEX_API_KEY (or MESSAGES_URL) to be set")
 ADMINS = [int(x) for x in os.environ.get("ADMINS", "").split(",") if x.strip()]
 if not ADMINS:
     raise SystemExit("ADMINS is empty: set your Telegram user ID in .env")
@@ -141,7 +141,7 @@ T = {
         "pick_service": "📲 <b>[ GET ACTIVE NODE ]</b>\n\nSelect your target service:",
         "pick_country": "📲 <b>[ GET ACTIVE NODE ]</b>\n\n🎯 Service: <b>{sid}</b>\n🌍 Select country:",
         "no_numbers": "🛑 <b>No numbers available right now.</b>",
-        "scanning": "🛰️ <b>[ NODE ALLOCATED ]</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🌍 <b>{country}</b>\n📱 <b>{sid}</b>\n\n📡 ⏳ Waiting for OTP... (valid {mins} min)",
+        "scanning": "{flag} <b>{country} {sid} Allocated</b> ✅\n\n<i>⏳ Waiting for OTP........</i>",
         "success": "✅ <b>[ OTP RECEIVED ]</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🌍 <b>{country}</b>\n📱 <b>{sid}</b>\n📟 <code>{num}</code>\n🔑 <code>{otp}</code>\n\n💵 +{rate} BDT",
         "timeout": "⌛ <b>No OTP received.</b> Try another number.",
         "cc": "🌍 With country code", "nocc": "🔢 Without country code",
@@ -177,7 +177,7 @@ T = {
         "pick_service": "📲 <b>[ নম্বর নোড কানেকশন ]</b>\n\nসার্ভিস সিলেক্ট করুন:",
         "pick_country": "📲 <b>[ নম্বর নোড কানেকশন ]</b>\n\n🎯 সার্ভিস: <b>{sid}</b>\n🌍 দেশ সিলেক্ট করুন:",
         "no_numbers": "🛑 <b>এখন কোনো নম্বর নেই।</b>",
-        "scanning": "🛰️ <b>[ নম্বর বরাদ্দ ]</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🌍 <b>{country}</b>\n📱 <b>{sid}</b>\n\n📡 ⏳ ওটিপি স্ক্যান করা হচ্ছে... ({mins} মিনিট বৈধ)",
+        "scanning": "{flag} <b>{country} {sid} বরাদ্দ</b> ✅\n\n<i>⏳ ওটিপির অপেক্ষায়........</i>",
         "success": "✅ <b>[ ওটিপি সফল ]</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🌍 <b>{country}</b>\n📱 <b>{sid}</b>\n📟 <code>{num}</code>\n🔑 <code>{otp}</code>\n\n💵 +{rate} BDT",
         "timeout": "⌛ <b>ওটিপি আসেনি।</b> অন্য নম্বর নিন।",
         "cc": "🌍 কান্ট্রি কোড সহ", "nocc": "🔢 কান্ট্রি কোড ছাড়া",
@@ -220,6 +220,7 @@ if os.path.exists(DB_FILE):
 db.setdefault("rates", {})
 db.setdefault("held", {})      # old numbers (after Change Number) that keep delivering OTPs to their user
 db.setdefault("pools", {})
+db.setdefault("emoji", {})     # button key -> Telegram custom emoji id (set with /setemoji)
 # the service list lives in the database so the admin can add/remove services from the bot
 if db.get("services"):
     SERVICES[:] = db["services"]
@@ -316,6 +317,49 @@ def esc(s):
 
 def is_admin(uid):
     return uid in ADMINS
+
+# ==================== CUSTOM EMOJI ON BUTTONS ====================
+def eb(text, key, **kw):
+    """InlineKeyboardButton with a premium custom emoji icon (if one was set with /setemoji KEY ID).
+    Falls back to a normal button when no emoji is set."""
+    api = dict(kw.pop("api_kwargs", None) or {})
+    eid = db.get("emoji", {}).get(key)
+    if eid:
+        api["icon_custom_emoji_id"] = eid
+    return InlineKeyboardButton(text, api_kwargs=api or None, **kw)
+
+async def emoji_ids(update, ctx):
+    """Admin sends any message containing custom emoji -> bot replies with their ids."""
+    if not is_admin(update.effective_user.id):
+        return
+    m = update.message
+    ents = [e for e in (m.entities or []) + (m.caption_entities or []) if e.type == "custom_emoji"]
+    if not ents:
+        return
+    lines = [f"<code>{e.custom_emoji_id}</code>" for e in ents]
+    await m.reply_text("Custom emoji ids:\n" + "\n".join(lines) +
+                       "\n\nUse: /setemoji KEY ID\nExample: /setemoji WHATSAPP " + ents[0].custom_emoji_id,
+                       parse_mode="HTML")
+
+async def setemoji(update, ctx):
+    """/setemoji KEY ID   |   /setemoji KEY off   |   /setemoji (list).
+    KEY = a service name (WHATSAPP) or a button: cc nocc change view_otp cancel"""
+    if not is_admin(update.effective_user.id):
+        return
+    a = ctx.args
+    if len(a) < 2:
+        cur = "\n".join(f"{k}: {v}" for k, v in db["emoji"].items()) or "none yet"
+        return await update.message.reply_text(
+            "Usage: /setemoji KEY EMOJI_ID  (or /setemoji KEY off)\n"
+            "KEY = service name (e.g. WHATSAPP) or cc / nocc / change / view_otp / cancel\n\n"
+            "Send me a message with a premium emoji to get its id.\n\nCurrent:\n" + cur)
+    key = a[0] if a[0] in ("cc", "nocc", "change", "view_otp", "cancel") else a[0].upper()
+    if a[1].lower() == "off":
+        db["emoji"].pop(key, None)
+    else:
+        db["emoji"][key] = a[1]
+    save()
+    await update.message.reply_text(f"✅ {key} -> {a[1]}")
 
 # ==================== KEYBOARDS ====================
 def main_menu(u, uid):
@@ -713,8 +757,7 @@ async def do_action(update, ctx, u, action):
     uid = update.effective_user.id
     m = update.message
     if action == "get":
-        btns = [InlineKeyboardButton(sv, callback_data=f"svc:{sv}") for sv in SERVICES]
-        kb = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+        kb = [[eb(sv, sv, callback_data=f"svc:{sv}")] for sv in SERVICES]     # one per row, with emoji icon
         await m.reply_text(tr(u, "pick_service"), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
     elif action == "traffic":
         top = sorted(db["users"].items(), key=lambda kv: kv[1]["otps"], reverse=True)[:10]
@@ -766,26 +809,28 @@ def fmt_num(num, fmt):
 def view_btn(u, num):
     """View OTP: opens the public OTP group when OTP_GROUP_LINK is set, otherwise checks the OTP in a popup."""
     if OTP_GROUP_LINK:
-        return InlineKeyboardButton(tr(u, "view_otp"), url=OTP_GROUP_LINK)
-    return InlineKeyboardButton(tr(u, "view_otp"), callback_data=f"vo:{num}")
+        return eb(tr(u, "view_otp"), "view_otp", url=OTP_GROUP_LINK)
+    return eb(tr(u, "view_otp"), "view_otp", callback_data=f"vo:{num}")
 
 def scanning_text(u, country, sid, mins, nums, fmt):
-    """Build waiting message with numbers as <code> so user can tap to copy."""
-    lines = [tr(u, "scanning", country=country, sid=sid, mins=mins), ""]
-    for num in nums:
-        flag = PREFIXES.get(country_of(num)[0], ("🌍", ""))[0]
-        lines.append(f"{flag} <code>{esc(fmt_num(num, fmt))}</code>")
-    return "\n".join(lines)
+    """Waiting message. The numbers themselves are shown as big copy buttons (see batch_kb)."""
+    flag = PREFIXES.get(country_of(nums[0])[0], ("🌍", ""))[0] if nums else "🌍"
+    return tr(u, "scanning", flag=flag, country=country, sid=sid, mins=mins)
 
 def batch_kb(u, sid, prefix, nums, fmt, first_num):
-    """Keyboard: format / change / view / cancel (numbers are in the message text as copyable code)."""
+    """Keyboard: one copy button per number, then format / change / view / cancel."""
     mark = lambda k: ("✅ " if fmt == k else "") + tr(u, k)
     rows = []
-    rows.append([InlineKeyboardButton(mark("cc"), callback_data=f"fmt:{first_num}:cc"),
-                 InlineKeyboardButton(mark("nocc"), callback_data=f"fmt:{first_num}:nocc")])
-    rows.append([InlineKeyboardButton(tr(u, "change"), callback_data=f"chg:{sid}:{prefix}:{first_num}"),
+    for n in nums:                      # one number per row = full-width green copy button
+        flag = PREFIXES.get(country_of(n)[0], ("🌍", ""))[0]
+        shown = fmt_num(n, fmt)
+        rows.append([InlineKeyboardButton(f"{flag} {shown}", copy_text=CopyTextButton(text=shown),
+                                          api_kwargs={"style": "success"})])
+    rows.append([eb(mark("cc"), "cc", callback_data=f"fmt:{first_num}:cc"),
+                 eb(mark("nocc"), "nocc", callback_data=f"fmt:{first_num}:nocc")])
+    rows.append([eb(tr(u, "change"), "change", callback_data=f"chg:{sid}:{prefix}:{first_num}"),
                  view_btn(u, first_num)])
-    rows.append([InlineKeyboardButton(tr(u, "cancel"), callback_data=f"cancel:{first_num}")])
+    rows.append([eb(tr(u, "cancel"), "cancel", callback_data=f"cancel:{first_num}")])
     return InlineKeyboardMarkup(rows)
 
 def num_kb(u, sid, prefix, num, fmt):
@@ -945,8 +990,16 @@ async def wait_otp(ctx, num, timeout=None):
         e = ACTIVE.pop(num, None)
         if e and e.get("moved"):
             return                         # old number after Change Number: its message now shows another number
-        # Timeout: do NOT message the user. Silently release the number and clear buttons.
-        if e and e.get("msg"):
+        if e and not e.get("count") and e.get("msg"):
+            # For multi-number batches just notify; don't wipe the whole allocation message
+            try:
+                u = db["users"][e["uid"]]
+                await e["msg"].reply_text(
+                    f"⌛ No OTP for <code>{fmt_num(num, e.get('fmt', 'cc'))}</code>",
+                    parse_mode="HTML")
+            except Exception:
+                pass
+        elif e and e.get("msg"):
             try:
                 await e["msg"].edit_reply_markup(reply_markup=None)
             except Exception:
@@ -1320,6 +1373,8 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("addnumbers", addnumbers))
+    app.add_handler(CommandHandler("setemoji", setemoji))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Entity("custom_emoji"), emoji_ids), group=-2)
     app.add_handler(CommandHandler(["ban", "unban", "addbal", "broadcast", "setrate", "rates", "clearnumbers", "assign", "addservice", "delservice", "delnumbers", "delcountry", "testgroup", "setotpgroup"], admin_cmds))
     app.add_handler(CallbackQueryHandler(on_cb))
     if SMS_SOURCE == "group":
