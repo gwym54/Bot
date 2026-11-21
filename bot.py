@@ -220,6 +220,7 @@ if os.path.exists(DB_FILE):
 db.setdefault("rates", {})
 db.setdefault("held", {})      # old numbers (after Change Number) that keep delivering OTPs to their user
 db.setdefault("pools", {})
+db.setdefault("settings", {})  # admin-editable settings (e.g. numbers per request)
 db.setdefault("emoji", {})     # button key -> Telegram custom emoji id (set with /setemoji)
 # the service list lives in the database so the admin can add/remove services from the bot
 if db.get("services"):
@@ -288,6 +289,23 @@ def rates_text_and_kb():
     rows.append([InlineKeyboardButton("✏️ Set custom amount", callback_data="adm:ratecustom")])
     rows.append([InlineKeyboardButton("« Back", callback_data="adm:back")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+def get_npr():
+    """Numbers given per GET NUMBER tap: set from the admin panel, falls back to NUMBERS_PER_REQUEST."""
+    try:
+        n = int(db.get("settings", {}).get("npr", NUMBERS_PER_REQUEST))
+    except (TypeError, ValueError):
+        n = NUMBERS_PER_REQUEST
+    return max(1, min(10, n))
+
+def npr_text_and_kb():
+    cur = get_npr()
+    btns = [InlineKeyboardButton(("✅ " if n == cur else "") + str(n), callback_data=f"adm:nprset:{n}")
+            for n in range(1, 9)]
+    rows = [btns[i:i + 4] for i in range(0, len(btns), 4)]
+    rows.append([InlineKeyboardButton("« Back", callback_data="adm:back")])
+    return (f"🔢 <b>Numbers per request</b>\n\nEvery user now gets <b>{cur}</b> number(s) per Get Number tap.\n"
+            "Choose a new amount:"), InlineKeyboardMarkup(rows)
 
 def save():
     tmp = DB_FILE + ".tmp"
@@ -786,7 +804,8 @@ async def do_action(update, ctx, u, action):
     elif action == "admin" and is_admin(uid):
         rows = [[InlineKeyboardButton("📊 Stats", callback_data="adm:stats")],
                 [InlineKeyboardButton("💸 Pending withdrawals", callback_data="adm:pend")],
-                [InlineKeyboardButton("💵 OTP Rates", callback_data="adm:rates")]]
+                [InlineKeyboardButton("💵 OTP Rates", callback_data="adm:rates")],
+                [InlineKeyboardButton(f"🔢 Numbers per request: {get_npr()}", callback_data="adm:npr")]]
         rows += [[InlineKeyboardButton(f"➕ Add numbers: {sv} ({len(db['pools'].get(sv, []))})",
                                        callback_data=f"adm:add:{sv}")] for sv in SERVICES]
         rows.append([InlineKeyboardButton("🗑 Remove numbers", callback_data="adm:rmmenu")])
@@ -856,7 +875,7 @@ def load_held():
         log.info("Loaded %s old numbers that still deliver OTPs", len(db["held"]))
 
 async def allocate(update, ctx, u, sid, prefix, replace=None):
-    """Gives NUMBERS_PER_REQUEST numbers together in ONE message with stacked number buttons.
+    """Gives get_npr() numbers together in ONE message with stacked number buttons.
     Change Number releases the whole batch and allocates a fresh set into the same message."""
     q = update.callback_query
     uid = str(update.effective_user.id)
@@ -885,7 +904,7 @@ async def allocate(update, ctx, u, sid, prefix, replace=None):
                     persist_held(n, e)
     pool = db["pools"].setdefault(sid, [])
     cands = [n for n in pool if n.startswith(prefix) and n not in ACTIVE]
-    picks = random.sample(cands, min(NUMBERS_PER_REQUEST, len(cands)))
+    picks = random.sample(cands, min(get_npr(), len(cands)))
     if not picks:
         target = old_msg or q.message
         try:
@@ -991,14 +1010,7 @@ async def wait_otp(ctx, num, timeout=None):
         if e and e.get("moved"):
             return                         # old number after Change Number: its message now shows another number
         if e and not e.get("count") and e.get("msg"):
-            # For multi-number batches just notify; don't wipe the whole allocation message
-            try:
-                u = db["users"][e["uid"]]
-                await e["msg"].reply_text(
-                    f"⌛ No OTP for <code>{fmt_num(num, e.get('fmt', 'cc'))}</code>",
-                    parse_mode="HTML")
-            except Exception:
-                pass
+            pass                           # timed out with no OTP: stay silent (no "No OTP for ..." message)
         elif e and e.get("msg"):
             try:
                 await e["msg"].edit_reply_markup(reply_markup=None)
@@ -1113,6 +1125,24 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.message.reply_text(
                 f"👥 Users: {len(db['users'])}\n📦 Pools:\n{pool_summary()}\n🔑 OTPs: {tot}\n"
                 f"💵 Total balances: {sum(x['balance'] for x in db['users'].values()):.2f} BDT")
+        if data == "adm:npr":
+            text, kb = npr_text_and_kb()
+            try:
+                return await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                return await q.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+        if data.startswith("adm:nprset:"):
+            try:
+                n = max(1, min(10, int(data.split(":")[2])))
+            except ValueError:
+                return
+            db["settings"]["npr"] = n
+            save()
+            text, kb = npr_text_and_kb()
+            try:
+                return await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                return
         if data == "adm:rates":
             text, kb = rates_text_and_kb()
             try:
