@@ -43,7 +43,7 @@ log = logging.getLogger("bot")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 # SMS_SOURCE=group : Teleroutex forwards SMS into a Telegram group/channel (SOURCE_GROUP_ID); bot reads it
 # SMS_SOURCE=api   : bot polls MESSAGES_URL instead
-SMS_SOURCE = os.environ.get("SMS_SOURCE", "group")
+SMS_SOURCE = os.environ.get("SMS_SOURCE", "api")
 SOURCE_GROUP_ID = int(os.environ.get("SOURCE_GROUP_ID", "0"))
 MESSAGES_URL = os.environ.get("MESSAGES_URL", "")
 # API mode (SMS_SOURCE=api): either set TELEROUTEX_API_KEY (recommended) or a full MESSAGES_URL
@@ -1054,38 +1054,60 @@ async def wait_otp(ctx, num, timeout=None):
     except asyncio.CancelledError:
         pass
 
+BASELINE_DONE = False
+
+def guess_service(cli, text):
+    """Best-effort service name from the SMS sender / text, for numbers nobody holds."""
+    s = f"{cli or ''} {text or ''}".upper()
+    for sid in SERVICES:
+        if sid in s:
+            return sid
+    for key, sid in (("FB", "FACEBOOK"), ("WHATS", "WHATSAPP"), ("INSTA", "INSTAGRAM"), ("TIK", "TIKTOK")):
+        if key in s and sid in SERVICES:
+            return sid
+    return "OTHER"
+
 async def api_check(app):
-    """Fetch the newest SMS once and deliver any OTP for a waiting number. Raises if the API call fails."""
+    """Fetch the newest SMS. Every new OTP SMS is posted to the public OTP group;
+    if a user holds the number, it is also forwarded to that user. Raises if the API call fails."""
+    global BASELINE_DONE
     recs = await fetch_records()
-    for rec in recs:
+    if not BASELINE_DONE:                      # first run: ignore old SMS already in the panel
+        for rec in recs:
+            seen_ids.add(rec.get("_id"))
+        BASELINE_DONE = True
+        return
+    for rec in reversed(recs):                 # oldest first, so the group stays in order
         rid = rec.get("_id")
-        if rid in seen_ids:
-            continue
-        num = re.sub(r"\D", "", str(rec.get("number", "")))
-        e = ACTIVE.get(num)
-        if not e:
-            continue
-        t = parse_time(rec.get("createdAt", ""))
-        if t and t < e["since"]:
+        if not rid or rid in seen_ids:
             continue
         text = rec.get("message", "")
         m = OTP_RE.search(text) or OTP_LONG_RE.search(text)
-        if m:
-            seen_ids.add(rid)
-            await complete(app, num, m.group(1), rec.get("cli"))
+        seen_ids.add(rid)
+        if not m:
+            continue
+        num = re.sub(r"\D", "", str(rec.get("number", "")))
+        cli = rec.get("cli")
+        t = parse_time(rec.get("createdAt", ""))
+        e = ACTIVE.get(num)
+        if e and not (t and t < e["since"]):
+            # a user holds this number: forward to the user (complete() also posts to the OTP group)
+            await complete(app, num, m.group(1), cli)
             e2 = ACTIVE.get(num)
             if e2 and t:
                 e2["since"] = t + timedelta(milliseconds=1)
                 if e2.get("moved") and num in db["held"]:
                     persist_held(num, e2)
+        else:
+            # nobody holds this number: post to the OTP group only
+            fake = {"sid": guess_service(cli, text), "country": country_of(num)[1]}
+            await post_public(app, fake, num, m.group(1), cli)
 
 async def api_poller(app):
     """API mode: ONE request every POLL_SECONDS for all waiting numbers."""
     log.info("API mode: checking Teleroutex every %ss", POLL_SECONDS)
     while True:
         await asyncio.sleep(POLL_SECONDS)
-        if not ACTIVE:
-            continue
         try:
             await api_check(app)
         except Exception as ex:
@@ -1135,6 +1157,14 @@ async def on_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     num, rest = match_active(text)
     if not num:
+        # nobody holds this number: still post it to the public OTP group (best effort)
+        flat = re.sub(r"[\s\-()+]", "", text)
+        mnum = re.search(r"(?<!\d)(\d{10,15})(?!\d)", flat)
+        mt = OTP_RE.search(text) or OTP_LONG_RE.search(text)
+        if mnum and mt:
+            n = mnum.group(1)
+            fake = {"sid": guess_service("", text), "country": country_of(n)[1]}
+            await post_public(ctx, fake, n, mt.group(1))
         return
     mt = OTP_RE.search(rest) or OTP_LONG_RE.search(rest)
     if mt:
