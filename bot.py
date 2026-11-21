@@ -535,6 +535,19 @@ async def on_document(update, ctx):
     if not is_admin(update.effective_user.id):
         return
     doc = update.message.document
+    if doc.file_name and doc.file_name.lower().endswith(".json"):
+        # RESTORE: admin sends a backup .json file -> it replaces DB_FILE, then restart the bot
+        f = await doc.get_file()
+        raw = bytes(await f.download_as_bytearray())
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            assert isinstance(data, dict) and "users" in data
+        except Exception:
+            return await update.message.reply_text("❌ This is not a valid backup file.")
+        with open(DB_FILE, "wb") as out:
+            out.write(raw)
+        return await update.message.reply_text(
+            "✅ Backup restored. Restart/redeploy the bot now (before anything else is saved).")
     if ctx.user_data.get("state") == "delnums":
         sid = ctx.user_data.pop("delsvc", None)
         ctx.user_data.pop("state")
@@ -1084,6 +1097,9 @@ async def api_check(app):
         text = rec.get("message", "")
         m = OTP_RE.search(text) or OTP_LONG_RE.search(text)
         seen_ids.add(rid)
+        log.info("new SMS for %s (otp found: %s, group set: %s, held: %s)",
+                 str(rec.get("number", ""))[:8] + "...", bool(m), bool(OTP_GROUP_ID),
+                 re.sub(r"\D", "", str(rec.get("number", ""))) in ACTIVE)
         if not m:
             continue
         num = re.sub(r"\D", "", str(rec.get("number", "")))
@@ -1111,7 +1127,8 @@ async def api_poller(app):
         try:
             await api_check(app)
         except Exception as ex:
-            log.warning("otp poll failed: %s", type(ex).__name__)   # no URL in the message: it contains the key
+            code = getattr(getattr(ex, "response", None), "status_code", "")
+            log.warning("otp poll failed: %s %s", type(ex).__name__, code)   # no URL in the message: it contains the key
 
 async def check_otp_group(app):
     if not OTP_GROUP_ID:
@@ -1127,9 +1144,37 @@ async def check_otp_group(app):
         log.warning("Cannot access the public OTP group (%s): %s. Check OTP_GROUP_ID and add the bot as admin.",
                     type(ex).__name__, ex)
 
+BACKUP_HOURS = float(os.environ.get("BACKUP_HOURS", "6"))   # auto-send db.json to admins (0 = off)
+
+async def send_backup(bot, chat_id):
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M")
+    with open(DB_FILE, "rb") as fh:
+        await bot.send_document(chat_id, fh, filename=f"db_backup_{stamp}.json",
+                                caption="💾 Backup. To restore: send this file back to the bot, then restart it.")
+
+async def backup_cmd(update, ctx):
+    if not is_admin(update.effective_user.id):
+        return
+    try:
+        await send_backup(ctx.bot, update.effective_user.id)
+    except Exception as ex:
+        await update.message.reply_text(f"❌ Backup failed: {type(ex).__name__}: {ex}")
+
+async def backup_loop(app):
+    while BACKUP_HOURS > 0:
+        await asyncio.sleep(BACKUP_HOURS * 3600)
+        for adm in ADMINS:
+            try:
+                await send_backup(app.bot, adm)
+            except Exception as ex:
+                log.warning("auto backup failed: %s", type(ex).__name__)
+
 async def post_init(app):
     load_held()
     await check_otp_group(app)
+    log.info("Started: SMS_SOURCE=%s, OTP_GROUP_ID=%s, DB_FILE=%s", SMS_SOURCE, OTP_GROUP_ID, DB_FILE)
+    if BACKUP_HOURS > 0:
+        app.bot_data["backup"] = asyncio.create_task(backup_loop(app))
     if SMS_SOURCE == "api":
         app.bot_data["poller"] = asyncio.create_task(api_poller(app))
 
@@ -1474,6 +1519,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("addnumbers", addnumbers))
     app.add_handler(CommandHandler("setemoji", setemoji))
+    app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Entity("custom_emoji"), emoji_ids), group=-2)
     app.add_handler(CommandHandler(["ban", "unban", "addbal", "broadcast", "setrate", "rates", "clearnumbers", "assign", "addservice", "delservice", "delnumbers", "delcountry", "testgroup", "setotpgroup"], admin_cmds))
     app.add_handler(CallbackQueryHandler(on_cb))
