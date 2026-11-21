@@ -66,6 +66,7 @@ SUPPORT_LINK = os.environ.get("SUPPORT_LINK", CHANNEL_LINK)
 # invite link of the public OTP group: the View OTP button opens it directly
 OTP_GROUP_LINK = os.environ.get("OTP_GROUP_LINK", "").strip()
 DEVELOPER_LINK = os.environ.get("DEVELOPER_LINK", SUPPORT_LINK)
+TRAFFIC_MINUTES = int(os.environ.get("TRAFFIC_MINUTES", "15"))                                 # window of the Traffic report
 TIMEZONE_HOURS = float(os.environ.get("TIMEZONE_HOURS", "6"))   # time shown in the public group (6 = Bangladesh)
 OTP_RATE = float(os.environ.get("OTP_RATE", "0.80"))
 # every OTP that arrives while the user holds the number is forwarded; 1 = pay for each, 0 = pay only the first
@@ -132,7 +133,7 @@ PREFIXES = {code: (_flag(iso), name) for code, (iso, name) in CALLING.items()}
 T = {
     "en": {
         "welcome": "💎 <b>[ ACCESS GRANTED ]</b> 💎\n━━━━━━━━━━━━━━━━━━━━━━\n🟢 Connection: <code>SECURE</code>",
-        "get": "💬 GET NUMBER", "traffic": "📟 TRAFFIC", "twofa": "🔐 2FA ONLINE",
+        "get": "💬 GET NUMBER", "traffic": "🏆 LEADERBOARD", "live": "📟 TRAFFIC",
         "profile": "👤 PROFILE", "refer": "🎁 Refer", "support": "👤 SUPPORT",
         "lang": "🌐 LANGUAGE", "admin": "⚙️ ADMIN PANEL",
         "banned": "🛑 YOU ARE BANNED!",
@@ -168,7 +169,7 @@ T = {
     },
     "bn": {
         "welcome": "💎 <b>[ নোড অ্যাক্সেস সফল ]</b> 💎\n━━━━━━━━━━━━━━━━━━━━━━\n🟢 সংযোগ: <code>সক্রিয়</code>",
-        "get": "💬 নম্বর নিন", "traffic": "📟 লিডারবোর্ড", "twofa": "🔐 2FA অনলাইন",
+        "get": "💬 নম্বর নিন", "traffic": "🏆 লিডারবোর্ড", "live": "📟 ট্রাফিক",
         "profile": "👤 প্রোফাইল", "refer": "🎁 রেফার করুন", "support": "👤 সাপোর্ট",
         "lang": "🌐 ভাষা পরিবর্তন", "admin": "⚙️ অ্যাডমিন প্যানেল",
         "banned": "🛑 আপনি ব্যান হয়েছেন!",
@@ -205,8 +206,9 @@ T = {
 }
 LABEL_ACTIONS = {}
 for _l, _d in T.items():
-    for _k in ("get", "traffic", "twofa", "profile", "refer", "support", "lang", "admin"):
+    for _k in ("get", "traffic", "live", "profile", "refer", "support", "lang", "admin"):
         LABEL_ACTIONS[_d[_k]] = _k
+LABEL_ACTIONS["📟 লিডারবোর্ড"] = "traffic"       # old Bengali leaderboard label (old keyboards)
 
 # ==================== STORAGE ====================
 db = {"users": {}, "pool": [], "pools": {}, "withdraws": {}, "wd_seq": 0}
@@ -220,6 +222,7 @@ if os.path.exists(DB_FILE):
 db.setdefault("rates", {})
 db.setdefault("held", {})      # old numbers (after Change Number) that keep delivering OTPs to their user
 db.setdefault("pools", {})
+db.setdefault("traffic", [])   # latest received OTPs (for the Traffic button)
 db.setdefault("settings", {})  # admin-editable settings (e.g. numbers per request)
 db.setdefault("emoji", {})     # button key -> Telegram custom emoji id (set with /setemoji)
 # the service list lives in the database so the admin can add/remove services from the bot
@@ -382,7 +385,7 @@ async def setemoji(update, ctx):
 # ==================== KEYBOARDS ====================
 def main_menu(u, uid):
     t = T[u["lang"]]
-    rows = [[t["get"]], [t["traffic"], t["twofa"]], [t["profile"], t["refer"]], [t["support"], t["lang"]]]
+    rows = [[t["get"]], [t["traffic"], t["live"]], [t["profile"], t["refer"]], [t["support"], t["lang"]]]
     if is_admin(uid):
         rows.append([t["admin"]])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -771,6 +774,36 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
+def traffic_text(u):
+    """Real-time traffic report: OTPs received in the last TRAFFIC_MINUTES minutes, per service and country."""
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(minutes=TRAFFIC_MINUTES)
+    stats = {}                                 # service -> {country name: count}
+    for x in db.get("traffic", []):
+        t = parse_time(x.get("t"))
+        if not t or t < since:
+            continue
+        _, label = country_of(x["num"])        # already "🇮🇹 Italy"
+        sv = stats.setdefault(x["sid"], {})
+        sv[label] = sv.get(label, 0) + 1
+    head = (f"📈 <b>REAL-TIME TRAFFIC REPORT</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🌘 <b>LAST {TRAFFIC_MINUTES} MINUTES (HOT TRAFFIC):</b>\n\n")
+    stamp = now.astimezone(timezone(timedelta(hours=TIMEZONE_HOURS))).strftime("%H:%M:%S")
+    foot = f"\n━━━━━━━━━━━━━━━━━━━━━━\n🕐 <i>Updated {stamp} (Showing Real-Time OTP Volume)</i>"
+    if not stats:
+        return head + "No OTP received in this time." + foot
+    blocks = []
+    for sid, cs in sorted(stats.items(), key=lambda kv: sum(kv[1].values()), reverse=True)[:10]:
+        rows = [f"   └ {lab} ⚡ <b>[{n} OTPs]</b>" for lab, n in sorted(cs.items(), key=lambda kv: kv[1], reverse=True)[:5]]
+        blocks.append(f"📱 <b>{esc(sid)}</b>\n" + "\n".join(rows))
+    return head + "\n\n".join(blocks) + "\n" + foot
+
+def traffic_kb():
+    rows = [[InlineKeyboardButton("🔄 Refresh", callback_data="trf", api_kwargs={"style": "success"})]]
+    if OTP_GROUP_LINK:
+        rows.append([InlineKeyboardButton("👀 OTP Group", url=OTP_GROUP_LINK, api_kwargs={"style": "success"})])
+    return InlineKeyboardMarkup(rows)
+
 async def do_action(update, ctx, u, action):
     uid = update.effective_user.id
     m = update.message
@@ -782,9 +815,8 @@ async def do_action(update, ctx, u, action):
         medals = ["🥇", "🥈", "🥉"] + ["🏅"] * 7
         lines = [f"{medals[i]} {esc(x['name'][:15])} — <code>{x['otps']}</code>" for i, (_, x) in enumerate(top)]
         await m.reply_text(tr(u, "board") + "\n".join(lines), parse_mode="HTML")
-    elif action == "twofa":
-        ctx.user_data["state"] = "2fa"
-        await m.reply_text(tr(u, "ask_2fa"), parse_mode="HTML")
+    elif action == "live":
+        await m.reply_text(traffic_text(u), parse_mode="HTML", reply_markup=traffic_kb())
     elif action == "profile":
         kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(u, "withdraw"), callback_data="wd")]])
         await m.reply_text(tr(u, "profile_msg", name=esc(u["name"]), uid=uid, bal=u["balance"], tn=u["dn"],
@@ -961,6 +993,9 @@ async def complete(ctx, num, otp, cli=None):
         u["balance"] += rate
         u["otps"] += 1
         u["do"] += 1
+    db["traffic"].append({"t": datetime.now(timezone.utc).isoformat(), "sid": e["sid"], "num": num})
+    cut = datetime.now(timezone.utc) - timedelta(minutes=max(TRAFFIC_MINUTES, 15) + 15)
+    db["traffic"] = [x for x in db["traffic"] if (parse_time(x.get("t")) or cut) >= cut]   # drop old entries
     save()
     text = tr(u, "success", country=e["country"], sid=e["sid"], num=fmt_num(num, e["fmt"]),
               otp=esc(otp), rate=rate)
@@ -1356,6 +1391,11 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
             except Exception:
                 pass
+    elif data == "trf":
+        try:
+            await q.edit_message_text(traffic_text(u), parse_mode="HTML", reply_markup=traffic_kb())
+        except Exception:
+            pass                           # nothing changed since last refresh
     elif data.startswith("copy:"):
         # Numbers are now shown as <code> in the message — no popup needed
         await q.answer()
