@@ -70,14 +70,14 @@ TRAFFIC_MINUTES = int(os.environ.get("TRAFFIC_MINUTES", "15"))                  
 TIMEZONE_HOURS = float(os.environ.get("TIMEZONE_HOURS", "6"))   # time shown in the public group (6 = Bangladesh)
 OTP_RATE = float(os.environ.get("OTP_RATE", "0.80"))
 # every OTP that arrives while the user holds the number is forwarded; 1 = pay for each, 0 = pay only the first
-PAY_EVERY_OTP = os.environ.get("PAY_EVERY_OTP", "1") == "1"
+PAY_EVERY_OTP = True   # fixed: the user is paid for every OTP / SMS received on the held number
 # public OTP group: how many leading digits of the code stay visible (0 = fully hidden)
 OTP_PUBLIC_VISIBLE_DIGITS = int(os.environ.get("OTP_PUBLIC_VISIBLE_DIGITS", "0"))
 REFERRAL_PRICE = 0
 MIN_WITHDRAW, MAX_WITHDRAW = 50, 10000
 NUMBERS_PER_REQUEST = int(os.environ.get("NUMBERS_PER_REQUEST", "3"))   # numbers given per GET NUMBER tap
 OTP_VALID_MINUTES = int(os.environ.get("OTP_VALID_MINUTES", "10"))       # how long each number waits for its OTP
-KEEP_OLD_MINUTES = int(os.environ.get("KEEP_OLD_MINUTES", "0"))          # after Change Number, old numbers deliver OTPs this long (0 = no time limit)
+KEEP_OLD_MINUTES = 0   # fixed: no timer          # after Change Number, old numbers deliver OTPs this long (0 = no time limit)
 POLL_SECONDS, POLL_TIMEOUT = 5, OTP_VALID_MINUTES * 60
 DB_FILE = os.environ.get("DB_FILE", "db.json")
 
@@ -982,8 +982,9 @@ async def allocate(update, ctx, u, sid, prefix, replace=None):
         _, country = country_of(num)
         entry = {"uid": uid, "sid": sid, "country": country, "msg": msg, "prefix": prefix, "fmt": fmt,
                  "batch": batch, "nums": list(picks), "since": datetime.now(timezone.utc) - timedelta(seconds=30)}
-        entry["task"] = asyncio.create_task(wait_otp(ctx, num))
+        entry["task"] = None                  # no timer: the user keeps the number and is paid for every SMS on it
         ACTIVE[num] = entry
+        persist_held(num, entry)              # saved, so it still works after a restart
     save()
 
 def hide_code(otp):
@@ -1067,6 +1068,48 @@ async def wait_otp(ctx, num, timeout=None):
     except asyncio.CancelledError:
         pass
 
+async def forward_text(app, num, text, cli, e):
+    """SMS with no code (links, invites, notices): send the full text to the holder and to the
+    public group. The holder is paid the same way as for an OTP (first SMS, or every SMS if PAY_EVERY_OTP)."""
+    rate = 0
+    if e:
+        first = e.get("count", 0) == 0
+        e["count"] = e.get("count", 0) + 1
+        e["last"] = "SMS"
+        u = db["users"][e["uid"]]
+        rate = get_rate(e["sid"]) if (first or PAY_EVERY_OTP) else 0
+        if rate or first:
+            u["balance"] += rate
+            u["otps"] += 1
+            u["do"] += 1
+        db["traffic"].append({"t": datetime.now(timezone.utc).isoformat(), "sid": e["sid"], "num": num})
+        cut = datetime.now(timezone.utc) - timedelta(minutes=max(TRAFFIC_MINUTES, 15) + 15)
+        db["traffic"] = [x for x in db["traffic"] if (parse_time(x.get("t")) or cut) >= cut]
+        save()
+        body = (f"📩 <b>SMS received</b>\n🌍 {esc(e['country'])} · {esc(e['sid'])}\n"
+                f"📟 <code>+{esc(num)}</code>\n"
+                + (f"📨 Sender: {esc(cli)}\n" if cli else "")
+                + f"\n{esc(text or '')}"
+                + (f"\n\n💰 +{rate}" if rate else ""))
+        try:
+            await app.bot.send_message(int(e["uid"]), body, parse_mode="HTML")
+        except Exception as ex:
+            log.warning("send failed: %s", ex)
+    if not OTP_GROUP_ID or OTP_GROUP_ID == SOURCE_GROUP_ID:
+        return
+    sid = e["sid"] if e else guess_service(cli, text)
+    country = e["country"] if e else country_of(num)[1]
+    now = datetime.now(timezone(timedelta(hours=TIMEZONE_HOURS))).strftime("%H:%M:%S")
+    lines = ["📩 <b>SMS RECEIVED</b>", f"📱 Service: <b>{esc(sid)}</b>", f"🌍 Country: {esc(country)}",
+             f"📟 Number: <code>+{num[:-3]}•••</code>"]
+    if cli:
+        lines.append(f"📨 Sender: {esc(cli)}")
+    lines += [f"💬 {esc((text or '')[:800])}", f"🕒 {now}"]
+    try:
+        await app.bot.send_message(OTP_GROUP_ID, "\n".join(lines), parse_mode="HTML")
+    except Exception as ex:
+        log.warning("public group post FAILED (%s): %s", type(ex).__name__, ex)
+
 BASELINE_DONE = False
 
 def guess_service(cli, text):
@@ -1100,12 +1143,16 @@ async def api_check(app):
         log.info("new SMS for %s (otp found: %s, group set: %s, held: %s)",
                  str(rec.get("number", ""))[:8] + "...", bool(m), bool(OTP_GROUP_ID),
                  re.sub(r"\D", "", str(rec.get("number", ""))) in ACTIVE)
-        if not m:
-            continue
         num = re.sub(r"\D", "", str(rec.get("number", "")))
         cli = rec.get("cli")
         t = parse_time(rec.get("createdAt", ""))
         e = ACTIVE.get(num)
+        if not m:
+            # no code in this SMS: still forward it (holder gets the text, group gets a masked copy)
+            if text.strip() and num:
+                holder = e if (e and not (t and t < e["since"])) else None
+                await forward_text(app, num, text, cli, holder)
+            continue
         if e and not (t and t < e["since"]):
             # a user holds this number: forward to the user (complete() also posts to the OTP group)
             await complete(app, num, m.group(1), cli)
