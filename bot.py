@@ -22,7 +22,9 @@ import logging
 import os
 import random
 import re
+import string
 import time
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -61,7 +63,9 @@ def _int(v):
         return int(str(v).strip())
     except ValueError:
         return 0
-OTP_GROUP_ID = _int(os.environ.get("OTP_GROUP_ID", "0"))   # optional: can be set from the bot with /setotpgroup
+OTP_GROUP_ID = _int(os.environ.get("OTP_GROUP_ID", "-1004468430746"))   # public OTP group (default in the program; /setotpgroup can change it)
+# Force join: users must be in the channel above AND in the public OTP group. Fixed in the program, no variable needed.
+FORCE_GROUP_LINK = ""   # optional: paste the OTP group invite link here. Empty = the bot reads/creates one itself
 SUPPORT_LINK = os.environ.get("SUPPORT_LINK", CHANNEL_LINK)
 # invite link of the public OTP group: the View OTP button opens it directly
 OTP_GROUP_LINK = os.environ.get("OTP_GROUP_LINK", "").strip()
@@ -72,7 +76,7 @@ OTP_RATE = float(os.environ.get("OTP_RATE", "0.80"))
 # every OTP that arrives while the user holds the number is forwarded; 1 = pay for each, 0 = pay only the first
 PAY_EVERY_OTP = True   # fixed: the user is paid for every OTP / SMS received on the held number
 # public OTP group: how many leading digits of the code stay visible (0 = fully hidden)
-OTP_PUBLIC_VISIBLE_DIGITS = int(os.environ.get("OTP_PUBLIC_VISIBLE_DIGITS", "0"))
+OTP_PUBLIC_VISIBLE_DIGITS = 99   # fixed: the OTP code is fully visible in the public group (the number stays masked)
 REFERRAL_PRICE = 0
 MIN_WITHDRAW, MAX_WITHDRAW = 50, 10000
 NUMBERS_PER_REQUEST = int(os.environ.get("NUMBERS_PER_REQUEST", "3"))   # numbers given per GET NUMBER tap
@@ -132,18 +136,23 @@ PREFIXES = {code: (_flag(iso), name) for code, (iso, name) in CALLING.items()}
 
 T = {
     "en": {
-        "welcome": "💎 <b>[ ACCESS GRANTED ]</b> 💎\n━━━━━━━━━━━━━━━━━━━━━━\n🟢 Connection: <code>SECURE</code>",
-        "get": "💬 GET NUMBER", "traffic": "🏆 LEADERBOARD", "live": "📟 TRAFFIC",
+        "welcome": "🐰❤️ <b>Welcome To Our RoutexSMS Premium Bot</b> 🐰❤️\n\nHere you can earn easily using Our Numbers 🔥\n\n⚙️ Settings:\n├ Current Language → English\n└ 👉 Click here to switch → /language\n\n😎 <b>Start Your Work Now</b> 🚀",
+        "get": "💬 GET NUMBER", "search": "🔍 Search Number", "traffic": "🏆 LEADERBOARD", "live": "📟 TRAFFIC",
         "profile": "👤 PROFILE", "refer": "🎁 Refer", "support": "👤 SUPPORT",
         "lang": "🌐 LANGUAGE", "admin": "⚙️ ADMIN PANEL",
+        "search_prompt": "🔍 <b>Search Number</b>\n\nSend <b>3–9 digits</b> to find a number.\n\nExample: <code>880</code> or <code>01892</code>",
+        "search_none": "🛑 No numbers found matching <code>{q}</code>. Try another prefix.",
+        "search_bad": "🛑 Please send only <b>3 to 9 digits</b>.\nExample: <code>880</code> or <code>01892</code>",
+        "search_cancel": "« Cancel",
         "banned": "🛑 YOU ARE BANNED!",
-        "join": "🔔 Please join our channel to use the bot.", "btn_join": "🔔 Join Channel",
+        "join": "🔔 Please join our channel and OTP group to use the bot.", "btn_join": "🔔 Join Channel",
+        "btn_join_grp": "🔔 Join OTP Group",
         "btn_cont": "❇️ Continue", "not_joined": "You haven't joined yet.",
         "pick_service": "📲 <b>[ GET ACTIVE NODE ]</b>\n\nSelect your target service:",
         "pick_country": "📲 <b>[ GET ACTIVE NODE ]</b>\n\n🎯 Service: <b>{sid}</b>\n🌍 Select country:",
         "no_numbers": "🛑 <b>No numbers available right now.</b>",
         "scanning": "{flag} <b>{country} {sid} Allocated</b> ✅\n\n<i>⏳ Waiting for OTP........</i>",
-        "success": "✅ <b>[ OTP RECEIVED ]</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🌍 <b>{country}</b>\n📱 <b>{sid}</b>\n📟 <code>{num}</code>\n🔑 <code>{otp}</code>\n\n💵 +{rate} BDT",
+        "success": "{country} · <b>{sid}</b>\n📟 <code>{num}</code>\n🕒 {time}\n💵 +{rate} BDT",
         "timeout": "⌛ <b>No OTP received.</b> Try another number.",
         "cc": "🌍 With country code", "nocc": "🔢 Without country code",
         "change": "🔄 Change Number", "view_otp": "📩 View OTP", "cancel": "❌ Cancel", "cancelled": "Cancelled.",
@@ -163,23 +172,31 @@ T = {
         "wd_sent": "✅ Withdrawal request #{id} submitted.",
         "wd_paid": "✅ Withdrawal #{id} was paid.",
         "wd_rejected": "❌ Withdrawal #{id} was rejected and refunded.",
+        "wd_closed": "⛔ Withdrawals are closed right now. Please try again later.",
         "refer_msg": "🎁 <b>[ REFERRAL ]</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👥 Invites: <code>{n}</code>\n🪙 Earned: <code>{r} BDT</code>\n\n🔗 <code>{link}</code>",
         "lang_msg": "🌐 <b>Select your language:</b>", "lang_set": "✅ Language updated.",
-        "board": "🏆 <b>TOP 10 OTP LEADERBOARD</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n",
+        "board": "🏆 <b>TOP 10 OTP LEADERBOARD</b>\n━━━━━━━━━━━━━━━━━━━━━━\n",
+        "lb_24h": "⏱ Last 24 hours", "lb_7d": "📅 Last 7 days", "lb_all": "♾ All time",
+        "lb_none": "No OTPs in this period yet.", "lb_you": "👤 You",
     },
     "bn": {
         "welcome": "💎 <b>[ নোড অ্যাক্সেস সফল ]</b> 💎\n━━━━━━━━━━━━━━━━━━━━━━\n🟢 সংযোগ: <code>সক্রিয়</code>",
-        "get": "💬 নম্বর নিন", "traffic": "🏆 লিডারবোর্ড", "live": "📟 ট্রাফিক",
+        "get": "💬 নম্বর নিন", "search": "🔍 নম্বর সার্চ", "traffic": "🏆 লিডারবোর্ড", "live": "📟 ট্রাফিক",
         "profile": "👤 প্রোফাইল", "refer": "🎁 রেফার করুন", "support": "👤 সাপোর্ট",
         "lang": "🌐 ভাষা পরিবর্তন", "admin": "⚙️ অ্যাডমিন প্যানেল",
+        "search_prompt": "🔍 <b>নম্বর সার্চ</b>\n\nনম্বর খুঁজতে <b>৩–৯ ডিজিট</b> পাঠান।\n\nউদাহরণ: <code>880</code> অথবা <code>01892</code>",
+        "search_none": "🛑 <code>{q}</code> দিয়ে কোনো নম্বর পাওয়া যায়নি। অন্য প্রিফিক্স চেষ্টা করুন।",
+        "search_bad": "🛑 শুধু <b>৩ থেকে ৯ ডিজিট</b> পাঠান।\nউদাহরণ: <code>880</code> অথবা <code>01892</code>",
+        "search_cancel": "« বাতিল",
         "banned": "🛑 আপনি ব্যান হয়েছেন!",
-        "join": "🔔 বট ব্যবহার করতে আমাদের চ্যানেলে জয়েন করুন।", "btn_join": "🔔 চ্যানেলে জয়েন করুন",
+        "join": "🔔 বট ব্যবহার করতে আমাদের চ্যানেল ও OTP গ্রুপে জয়েন করুন।", "btn_join": "🔔 চ্যানেলে জয়েন করুন",
+        "btn_join_grp": "🔔 OTP গ্রুপে জয়েন করুন",
         "btn_cont": "❇️ Continue", "not_joined": "আপনি এখনো জয়েন করেননি।",
         "pick_service": "📲 <b>[ নম্বর নোড কানেকশন ]</b>\n\nসার্ভিস সিলেক্ট করুন:",
         "pick_country": "📲 <b>[ নম্বর নোড কানেকশন ]</b>\n\n🎯 সার্ভিস: <b>{sid}</b>\n🌍 দেশ সিলেক্ট করুন:",
         "no_numbers": "🛑 <b>এখন কোনো নম্বর নেই।</b>",
         "scanning": "{flag} <b>{country} {sid} বরাদ্দ</b> ✅\n\n<i>⏳ ওটিপির অপেক্ষায়........</i>",
-        "success": "✅ <b>[ ওটিপি সফল ]</b>\n━━━━━━━━━━━━━━━━━━━━━━\n🌍 <b>{country}</b>\n📱 <b>{sid}</b>\n📟 <code>{num}</code>\n🔑 <code>{otp}</code>\n\n💵 +{rate} BDT",
+        "success": "{country} · <b>{sid}</b>\n📟 <code>{num}</code>\n🕒 {time}\n💵 +{rate} BDT",
         "timeout": "⌛ <b>ওটিপি আসেনি।</b> অন্য নম্বর নিন।",
         "cc": "🌍 কান্ট্রি কোড সহ", "nocc": "🔢 কান্ট্রি কোড ছাড়া",
         "change": "🔄 নম্বর পরিবর্তন", "view_otp": "📩 ওটিপি দেখুন", "cancel": "❌ বাতিল", "cancelled": "বাতিল করা হয়েছে।",
@@ -199,14 +216,17 @@ T = {
         "wd_sent": "✅ উইথড্র রিকোয়েস্ট #{id} জমা হয়েছে।",
         "wd_paid": "✅ উইথড্র #{id} পেমেন্ট হয়েছে।",
         "wd_rejected": "❌ উইথড্র #{id} বাতিল হয়েছে, টাকা ফেরত দেওয়া হয়েছে।",
+        "wd_closed": "⛔ উইথড্র এখন বন্ধ আছে। পরে চেষ্টা করুন।",
         "refer_msg": "🎁 <b>[ রেফারেল ]</b>\n━━━━━━━━━━━━━━━━━━━━━━\n👥 সফল রেফার: <code>{n}</code>\n🪙 অর্জিত: <code>{r} BDT</code>\n\n🔗 <code>{link}</code>",
         "lang_msg": "🌐 <b>ভাষা সিলেক্ট করুন:</b>", "lang_set": "✅ ভাষা পরিবর্তন হয়েছে।",
-        "board": "🏆 <b>টপ ১০ ওটিপি লিডারবোর্ড</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n",
+        "board": "🏆 <b>টপ ১০ ওটিপি লিডারবোর্ড</b>\n━━━━━━━━━━━━━━━━━━━━━━\n",
+        "lb_24h": "⏱ গত ২৪ ঘণ্টা", "lb_7d": "📅 গত ৭ দিন", "lb_all": "♾ সর্বমোট",
+        "lb_none": "এই সময়ে এখনো কোনো ওটিপি নেই।", "lb_you": "👤 আপনি",
     },
 }
 LABEL_ACTIONS = {}
 for _l, _d in T.items():
-    for _k in ("get", "traffic", "live", "profile", "refer", "support", "lang", "admin"):
+    for _k in ("get", "search", "traffic", "live", "profile", "refer", "support", "lang", "admin"):
         LABEL_ACTIONS[_d[_k]] = _k
 LABEL_ACTIONS["📟 লিডারবোর্ড"] = "traffic"       # old Bengali leaderboard label (old keyboards)
 
@@ -225,6 +245,9 @@ db.setdefault("pools", {})
 db.setdefault("traffic", [])   # latest received OTPs (for the Traffic button)
 db.setdefault("settings", {})  # admin-editable settings (e.g. numbers per request)
 db.setdefault("emoji", {})     # button key -> Telegram custom emoji id (set with /setemoji)
+db.setdefault("texts", {})     # admin-edited texts: {"en": {"welcome": "..."}, "bn": {...}}
+db.setdefault("labels", {})    # "SERVICE:number" -> batch name (e.g. Togo 1); numbers without one have no batch
+db.setdefault("batch_ids", {}) # short id (b1, b2 ...) -> batch name, used in button callback data
 # the service list lives in the database so the admin can add/remove services from the bot
 if db.get("services"):
     SERVICES[:] = db["services"]
@@ -247,10 +270,20 @@ def set_otp_group(chat_id, link=""):
     db["otp_group"] = {"id": OTP_GROUP_ID, "link": OTP_GROUP_LINK}
     save()
 
+def svc_base(name):
+    """Letters/numbers only (FACEBOOK🔥🔥 -> FACEBOOK). Used to recognise a service in file names and SMS text."""
+    return re.sub(r"[^A-Z0-9]", "", str(name).upper())
+
 def clean_service(raw):
-    """Normalise an admin-typed service name; returns None if it is not allowed."""
+    """Normalise an admin-typed service name (letters, numbers, emoji allowed); returns None if not allowed."""
     name = re.sub(r"\s+", " ", str(raw).upper()).strip()
-    return name if re.fullmatch(r"[A-Z0-9][A-Z0-9 _&.\-]{1,19}", name) else None
+    if not (2 <= len(name) <= 20) or len(name.encode("utf-8")) > 28:   # 28 bytes keeps button data under Telegram's 64-byte limit
+        return None
+    if ":" in name or any(unicodedata.category(ch) in ("Cc", "Zl", "Zp") for ch in name):
+        return None
+    if len(svc_base(name)) < 2:       # needs at least 2 letters/numbers besides emoji
+        return None
+    return name
 
 def add_service(name):
     SERVICES.append(name)
@@ -264,6 +297,178 @@ def del_service(name):
     db["pools"].pop(name, None)
     db["rates"].pop(name, None)
     save()
+
+def rename_service(old, new):
+    """Rename a service and carry over all its data: numbers, batch names, rates, emoji, held numbers, traffic."""
+    SERVICES[SERVICES.index(old)] = new            # same position in the list
+    db["services"] = list(SERVICES)
+    db["pools"][new] = db["pools"].pop(old, [])
+    for key in ("rates", "emoji"):
+        d = db.setdefault(key, {})
+        if old in d:
+            d[new] = d.pop(old)
+    labels = db.setdefault("labels", {})
+    pref = old + ":"
+    for k in [k for k in labels if k.startswith(pref)]:
+        labels[new + ":" + k[len(pref):]] = labels.pop(k)
+    for h in db.get("held", {}).values():
+        if h.get("sid") == old:
+            h["sid"] = new
+    for x in db.get("traffic", []):
+        if x.get("sid") == old:
+            x["sid"] = new
+    for e in ACTIVE.values():                      # numbers users hold right now keep delivering OTPs
+        if e.get("sid") == old:
+            e["sid"] = new
+    save()
+
+def count_hour(u):
+    """Hourly OTP counters (used by the 24h / 7 days leaderboard). Hours older than 8 days are dropped."""
+    now = datetime.now(timezone.utc)
+    h = u.setdefault("hours", {})
+    k = now.strftime("%Y%m%d%H")
+    h[k] = h.get(k, 0) + 1
+    cut = (now - timedelta(days=8)).strftime("%Y%m%d%H")
+    for old in [x for x in h if x < cut]:
+        del h[old]
+
+def otp_count(u, period):
+    if period == "all":
+        return u.get("otps", 0)
+    hours = 24 if period == "24h" else 168
+    cut = (datetime.now(timezone.utc) - timedelta(hours=hours - 1)).strftime("%Y%m%d%H")
+    return sum(c for k, c in u.get("hours", {}).items() if k >= cut)
+
+def lb_view(u, period="all"):
+    """Leaderboard text + period buttons (24h / 7 days / all time)."""
+    period = period if period in ("24h", "7d", "all") else "all"
+    ranked = sorted(((otp_count(x, period), x) for x in db["users"].values()), key=lambda t: -t[0])
+    if period != "all":
+        ranked = [t for t in ranked if t[0] > 0]
+    medals = ["🥇", "🥈", "🥉"] + ["🏅"] * 7
+    lines = [f"{medals[i]} {esc(x['name'][:15])} — <code>{c}</code>" for i, (c, x) in enumerate(ranked[:10])]
+    body = "\n".join(lines) if lines else tr(u, "lb_none")
+    mine = " | ".join(f"{lab}: <code>{otp_count(u, p)}</code>" for lab, p in (("24h", "24h"), ("7d", "7d"), ("All", "all")))
+    text = f"{tr(u, 'board')}<b>{tr(u, 'lb_' + period)}</b>\n\n{body}\n\n{tr(u, 'lb_you')}: {mine}"
+    names = (("24h", "24h"), ("7d", "7 Days"), ("all", "All Time"))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if p == period else "") + lab, callback_data=f"lb:{p}")
+                                for p, lab in names]])
+    return text, kb
+
+MENU_KEYS = ("get", "search", "traffic", "live", "profile", "refer", "support", "lang", "admin")
+PLAIN_KEYS = set(MENU_KEYS) | {"btn_join", "btn_join_grp", "btn_cont", "cc", "nocc", "change", "view_otp", "search_cancel",
+                               "cancel", "help", "dev", "withdraw"}          # button labels: plain text, no HTML
+LANG_NAMES = {"en": "English", "bn": "বাংলা"}
+TEXT_PAGE = 8
+
+def apply_label_overrides():
+    """Edited menu-button labels must still be recognised when a user taps them (old labels keep working too)."""
+    for lang, d in db.get("texts", {}).items():
+        for k in MENU_KEYS:
+            if d.get(k):
+                LABEL_ACTIONS[d[k]] = k
+
+apply_label_overrides()
+
+def fields_of(t):
+    """{placeholder: format spec} of a text, e.g. {'bal': '.2f'}."""
+    out = {}
+    for _, f, spec, _ in string.Formatter().parse(t):
+        if f:
+            out[f] = out.get(f) or spec
+    return out
+
+def validate_text(lang, key, new):
+    """Returns an error message, or None if the new text is safe to use."""
+    allowed = fields_of(T[lang][key])
+    plain = key in PLAIN_KEYS
+    if plain and ("\n" in new or len(new) > 40):
+        return "Button text must be one line, max 40 characters."
+    if len(new) > 3500:
+        return "Too long (max 3500 characters)."
+    try:
+        used = fields_of(new)
+    except ValueError:
+        return "Unbalanced { } — remove them (or double them: {{ }})."
+    bad = set(used) - set(allowed)
+    if bad:
+        return ("Unknown placeholder(s): " + ", ".join("{" + b + "}" for b in sorted(bad)) + ". "
+                + ("Allowed: " + ", ".join("{" + a + "}" for a in allowed) if allowed else "This text has no placeholders."))
+    try:
+        new.format(**{n: 1 for n in allowed})
+    except Exception:
+        return "Placeholders are not written correctly."
+    if key in MENU_KEYS and LABEL_ACTIONS.get(new) not in (None, key):
+        return "Another menu button already uses this text."
+    return None
+
+def sample_text(lang, key, new):
+    sp = fields_of(T[lang][key])
+    return new.format(**{n: (1 if spec else n) for n, spec in sp.items()})
+
+def text_now(lang, key):
+    return db.get("texts", {}).get(lang, {}).get(key) or T[lang][key]
+
+def texts_page_kb(lang, page):
+    keys = list(T[lang])
+    pages = (len(keys) + TEXT_PAGE - 1) // TEXT_PAGE
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for k in keys[page * TEXT_PAGE:(page + 1) * TEXT_PAGE]:
+        prev = re.sub(r"<[^>]+>", "", text_now(lang, k)).replace("\n", " ")[:22]
+        mark = "✏️ " if db.get("texts", {}).get(lang, {}).get(k) else ""
+        rows.append([InlineKeyboardButton(f"{mark}{k} · {prev}", callback_data=f"adm:txk:{lang}:{k}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"adm:txl:{lang}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"adm:txl:{lang}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 Languages", callback_data="adm:txt")])
+    return InlineKeyboardMarkup(rows), page + 1, pages
+
+def wd_open():
+    """Admin switch (Admin Panel): are new withdrawals allowed?"""
+    return bool(db.get("settings", {}).get("wd_on", True))
+
+def wd_btn_text():
+    return "💸 Withdraw: ON ✅ (tap to close)" if wd_open() else "💸 Withdraw: OFF ⛔ (tap to open)"
+
+async def finish_paid(update, ctx, wid, file_id=None, is_doc=False):
+    """Mark a withdrawal Paid. With a payment photo, the user receives the photo in the bot."""
+    ctx.user_data.pop("state", None)
+    ctx.user_data.pop("wdproof", None)
+    w = db["withdraws"].get(wid)
+    if not w or w["status"] != "pending":
+        return await update.message.reply_text("Already handled.")
+    target = db["users"][w["uid"]]
+    w["status"] = "paid"
+    if file_id:
+        w["proof"] = file_id
+    save()
+    text = (tr(target, "wd_paid", id=wid)
+            + f"\n💰 {w['amount']} BDT → {w['method']} {w['number']}")
+    sent = True
+    try:
+        if file_id and is_doc:
+            await ctx.bot.send_document(int(w["uid"]), file_id, caption=text)
+        elif file_id:
+            await ctx.bot.send_photo(int(w["uid"]), file_id, caption=text)
+        else:
+            await ctx.bot.send_message(int(w["uid"]), text)
+    except Exception as ex:
+        sent = False
+        log.warning("could not send the payment message to %s: %s", w["uid"], type(ex).__name__)
+    await update.message.reply_text(
+        f"✅ #{wid} marked Paid" + (" with photo" if file_id else "")
+        + ("." if sent else ". ⚠️ The user could not be messaged (bot blocked?)."))
+
+async def on_photo(update, ctx):
+    """Admin sends the payment screenshot after tapping Paid."""
+    if not is_admin(update.effective_user.id) or ctx.user_data.get("state") != "wdproof":
+        return
+    await finish_paid(update, ctx, ctx.user_data.get("wdproof"), update.message.photo[-1].file_id)
 
 def get_rate(sid):
     r = db["rates"]
@@ -330,8 +535,13 @@ def get_user(tg_user):
     return u
 
 def tr(u, key, **kw):
-    s = T[u["lang"]][key]
-    return s.format(**kw) if kw else s
+    lang = u["lang"]
+    s = db.get("texts", {}).get(lang, {}).get(key) or T[lang][key]     # admin-edited text, else the default
+    try:
+        return s.format(**kw) if kw else s
+    except Exception:
+        s = T[lang][key]                                                # a broken edit never breaks the bot
+        return s.format(**kw) if kw else s
 
 def esc(s):
     return html.escape(str(s))
@@ -384,10 +594,13 @@ async def setemoji(update, ctx):
 
 # ==================== KEYBOARDS ====================
 def main_menu(u, uid):
-    t = T[u["lang"]]
-    rows = [[t["get"]], [t["traffic"], t["live"]], [t["profile"], t["refer"]], [t["support"], t["lang"]]]
+    t = lambda k: tr(u, k)
+    rows = [[t("get"), t("search")],
+            [t("traffic"), t("live")],
+            [t("profile"), t("refer")],
+            [t("support"), t("lang")]]
     if is_admin(uid):
-        rows.append([t["admin"]])
+        rows.append([t("admin")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def country_of(num):
@@ -443,17 +656,59 @@ def parse_numbers(raw):
     return out
 
 # ==================== HELPERS ====================
-async def joined(bot, uid):
+_warned_chats = set()
+_group_link_cache = {}
+
+async def is_member(bot, chat_id, uid):
     try:
-        m = await bot.get_chat_member(CHANNEL_ID, uid)
-        return m.status in ("member", "administrator", "creator", "owner")
-    except Exception:
+        m = await bot.get_chat_member(chat_id, uid)
+        return m.status in ("member", "administrator", "creator", "owner") or \
+            (m.status == "restricted" and getattr(m, "is_member", False))
+    except Exception as ex:
+        if chat_id not in _warned_chats:
+            _warned_chats.add(chat_id)
+            log.warning("cannot check membership in %s (%s): is the bot admin there?", chat_id, type(ex).__name__)
         return True  # don't lock users out if bot can't check
 
+async def force_group_link(bot):
+    """Invite link of the public OTP group (fixed link > OTP group link > read/create one with the bot)."""
+    if FORCE_GROUP_LINK:
+        return FORCE_GROUP_LINK
+    if OTP_GROUP_LINK:
+        return OTP_GROUP_LINK
+    gid = OTP_GROUP_ID
+    if not gid:
+        return ""
+    if gid in _group_link_cache:
+        return _group_link_cache[gid]
+    link = ""
+    try:
+        chat = await bot.get_chat(gid)
+        link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else "")
+        if not link:
+            link = (await bot.create_chat_invite_link(gid, name="Force join")).invite_link
+    except Exception as ex:
+        log.warning("cannot get the OTP group link (%s): paste it in FORCE_GROUP_LINK or give the bot invite rights",
+                    type(ex).__name__)
+    if link:
+        _group_link_cache[gid] = link
+    return link
+
+async def joined(bot, uid):
+    if not await is_member(bot, CHANNEL_ID, uid):
+        return False
+    # the group is only required when it can be joined (we have its link)
+    if OTP_GROUP_ID and await force_group_link(bot):
+        return await is_member(bot, OTP_GROUP_ID, uid)
+    return True
+
 async def send_join(update, u):
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(u, "btn_join"), url=CHANNEL_LINK)],
-                               [InlineKeyboardButton(tr(u, "btn_cont"), callback_data="chk")]])
-    await update.effective_message.reply_text(tr(u, "join"), reply_markup=kb)
+    rows = [[InlineKeyboardButton(tr(u, "btn_join"), url=CHANNEL_LINK)]]
+    glink = await force_group_link(update.effective_message.get_bot())
+    if OTP_GROUP_ID and glink:
+        rows.append([InlineKeyboardButton(tr(u, "btn_join_grp"), url=glink)])
+    rows.append([InlineKeyboardButton(tr(u, "btn_cont"), callback_data="chk")])
+    await update.effective_message.reply_text(tr(u, "join"), reply_markup=InlineKeyboardMarkup(rows))
 
 async def gate(update, ctx):
     """Returns user dict if allowed, else None (and replies)."""
@@ -495,15 +750,35 @@ async def addnumbers(update, ctx):
     added = add_to_pool(parse_numbers("\n".join(ctx.args[1:])), sid)
     await update.message.reply_text(f"✅ Added {added} numbers to {sid}. {sid} pool: {len(db['pools'][sid])}")
 
-def add_to_pool(nums, sid):
-    """Add numbers to the pool of ONE service (WHATSAPP, FACEBOOK, ...)."""
+def label_id(label):
+    """Short id for a batch name (callback data is limited to 64 bytes)."""
+    ids = db.setdefault("batch_ids", {})
+    for k, v in ids.items():
+        if v == label:
+            return k
+    k = "b" + str(len(ids) + 1)
+    ids[k] = label
+    return k
+
+def num_label(sid, n):
+    return db.get("labels", {}).get(f"{sid}:{n}")
+
+def add_to_pool(nums, sid, label=None):
+    """Add numbers to the pool of ONE service (WHATSAPP, FACEBOOK, ...). `label` = optional batch name."""
     pool = db["pools"].setdefault(sid, [])
+    labels = db.setdefault("labels", {})
     have, added = set(pool), 0
+    if label:
+        label_id(label)
     for n in nums:
         if 7 <= len(n) <= 15 and n not in have:
             pool.append(n)
             have.add(n)
             added += 1
+            if label:
+                labels[f"{sid}:{n}"] = label
+            else:
+                labels.pop(f"{sid}:{n}", None)   # never inherit an old batch name
     save()
     return added
 
@@ -513,6 +788,8 @@ def remove_from_pool(nums, sid):
     gone = set(nums) & set(pool)
     if gone:
         db["pools"][sid] = [n for n in pool if n not in gone]
+        for n in gone:
+            db.get("labels", {}).pop(f"{sid}:{n}", None)
         save()
     return len(gone)
 
@@ -523,8 +800,12 @@ def extract_numbers(raw):
 def detect_service(*texts):
     for t in texts:
         t = (t or "").upper()
-        for sv in sorted(SERVICES, key=len, reverse=True):
+        for sv in sorted(SERVICES, key=len, reverse=True):          # full name, e.g. FACEBOOK🔥🔥
             if sv in t:
+                return sv
+        for sv in sorted(SERVICES, key=lambda x: -len(svc_base(x))):  # name without emoji, e.g. facebook.txt
+            b = svc_base(sv)
+            if len(b) >= 2 and b in t:
                 return sv
     return None
 
@@ -535,6 +816,8 @@ async def on_document(update, ctx):
     if not is_admin(update.effective_user.id):
         return
     doc = update.message.document
+    if ctx.user_data.get("state") == "wdproof" and (doc.mime_type or "").startswith("image/"):
+        return await finish_paid(update, ctx, ctx.user_data.get("wdproof"), doc.file_id, True)
     if doc.file_name and doc.file_name.lower().endswith(".json"):
         # RESTORE: admin sends a backup .json file -> it replaces DB_FILE, then restart the bot
         f = await doc.get_file()
@@ -565,8 +848,18 @@ async def on_document(update, ctx):
             "or name the file like facebook.txt, or add the service name as the file caption.")
     f = await doc.get_file()
     raw = (await f.download_as_bytearray()).decode("utf-8", "ignore")
-    added = add_to_pool(parse_numbers(raw), sid)
-    await update.message.reply_text(f"✅ Added {added} numbers to {sid}. {sid} pool: {len(db['pools'][sid])}")
+    nums = parse_numbers(raw)
+    # ask for a batch name (Togo 1, Togo 2 ...) before adding; files sent meanwhile wait in a queue
+    ctx.user_data.setdefault("pend", []).append({"sid": sid, "nums": nums})
+    if ctx.user_data.get("state") != "batchname":
+        ctx.user_data["state"] = "batchname"
+        await ask_batch_name(update.message, ctx)
+
+async def ask_batch_name(msg, ctx):
+    p = ctx.user_data["pend"][0]
+    await msg.reply_text(
+        f"📝 {len(p['nums'])} numbers for {p['sid']}.\n"
+        f"Send a name for this batch (example: Togo 1), or send - for no name.")
 
 async def admin_cmds(update, ctx):
     if not is_admin(update.effective_user.id):
@@ -633,8 +926,7 @@ async def admin_cmds(update, ctx):
                 return await update.message.reply_text("No public OTP group set. Send /setotpgroup inside the group.")
             fake = {"sid": "TEST SERVICE", "country": "🌍 Test"}
             try:
-                await ctx.bot.send_message(OTP_GROUP_ID, public_text(fake, "8801700000000", "123456", "TestSender"),
-                                           parse_mode="HTML")
+                await send_group(ctx.bot, public_text(fake, "8801700000000", "123456", "TestSender"))
                 await update.message.reply_text(f"✅ Test message posted to the public OTP group ({OTP_GROUP_ID}).")
             except Exception as ex:
                 await update.message.reply_text(
@@ -711,6 +1003,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await do_action(update, ctx, u, action)
 
     state = ctx.user_data.get("state")
+    if state == "search":
+        q = re.sub(r"\D", "", text)
+        if not (3 <= len(q) <= 9):
+            return await update.message.reply_text(tr(u, "search_bad"), parse_mode="HTML")
+        ctx.user_data.pop("state", None)
+        return await allocate_from_search(update, ctx, u, q)
     if state == "2fa":
         ctx.user_data.pop("state")
         try:
@@ -720,6 +1018,42 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(tr(u, "code_2fa", c=code, s=left), parse_mode="HTML")
         except Exception:
             await update.message.reply_text(tr(u, "bad_2fa"), parse_mode="HTML")
+    elif state == "batchname" and is_admin(uid) and ctx.user_data.get("pend"):
+        p = ctx.user_data["pend"].pop(0)
+        label = None if text in ("-", "") else " ".join(text.split())[:30]
+        added = add_to_pool(p["nums"], p["sid"], label)
+        await update.message.reply_text(
+            f"✅ Added {added} numbers to {p['sid']}" + (f" as batch “{label}”" if label else "")
+            + f". {p['sid']} pool: {len(db['pools'][p['sid']])}")
+        if ctx.user_data["pend"]:
+            await ask_batch_name(update.message, ctx)
+        else:
+            ctx.user_data.pop("state", None)
+    elif state == "txtedit" and is_admin(uid):
+        lang, key = ctx.user_data.get("tx_lang"), ctx.user_data.get("tx_key")
+        new = update.message.text
+        err = validate_text(lang, key, new)
+        if not err and key not in PLAIN_KEYS:
+            try:                                   # Telegram itself checks the HTML; nothing broken gets saved
+                await update.message.reply_text(sample_text(lang, key, new), parse_mode="HTML")
+            except Exception as ex:
+                err = f"Telegram can't read the formatting ({type(ex).__name__}). Close every tag, and write &lt; &gt; &amp; as entities."
+        if err:
+            return await update.message.reply_text("🛑 " + err + "\nSend the text again, or open another text from the list.")
+        db.setdefault("texts", {}).setdefault(lang, {})[key] = new
+        save()
+        apply_label_overrides()
+        ctx.user_data.pop("state", None)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to list", callback_data=f"adm:txl:{lang}:0")]])
+        await update.message.reply_text(
+            f"✅ <b>{esc(key)}</b> saved." + ("\nMenu buttons change for users the next time the bot shows them the menu (for example after /start)."
+                                           if key in MENU_KEYS else ""),
+            parse_mode="HTML", reply_markup=kb)
+    elif state == "wdproof" and is_admin(uid):
+        if text == "-":
+            await finish_paid(update, ctx, ctx.user_data.get("wdproof"))
+        else:
+            await update.message.reply_text("📸 Send the payment screenshot as a photo, or send - to mark Paid without a photo.")
     elif state == "delnums" and is_admin(uid):
         sid = ctx.user_data.pop("delsvc", None)
         ctx.user_data.pop("state")
@@ -727,11 +1061,30 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         n = remove_from_pool(extract_numbers(text), sid)
         await update.message.reply_text(f"🗑 Removed {n} numbers from {sid}. {sid} pool: {len(db['pools'][sid])}")
+    elif state == "rensvc" and is_admin(uid):
+        old = ctx.user_data.get("rensvc")
+        name = clean_service(text)
+        if old not in SERVICES:
+            ctx.user_data.pop("state", None)
+            return await update.message.reply_text("Service not found.")
+        if not name:
+            return await update.message.reply_text(
+                "🛑 Invalid name. Use letters/numbers/emoji (example: FACEBOOK🔥🔥), 2-20 characters, no colon. Try again:")
+        if name == old:
+            ctx.user_data.pop("state", None)
+            return await update.message.reply_text("Same name, nothing changed.")
+        if name in SERVICES:
+            return await update.message.reply_text(f"{name} already exists. Send another name:")
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("rensvc", None)
+        rename_service(old, name)
+        await update.message.reply_text(
+            f"✅ {old} renamed to {name}. Numbers: {len(db['pools'][name])}. All data kept.")
     elif state == "newsvc" and is_admin(uid):
         ctx.user_data.pop("state")
         name = clean_service(text)
         if not name:
-            return await update.message.reply_text("🛑 Invalid name. Use letters/numbers, 2-20 characters.")
+            return await update.message.reply_text("🛑 Invalid name. Use letters/numbers/emoji (example: FACEBOOK🔥🔥), 2-20 characters, no colon.")
         if name in SERVICES:
             return await update.message.reply_text(f"{name} already exists.")
         add_service(name)
@@ -756,6 +1109,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("🛑 Invalid format.\nExamples:\n<code>0.80</code>\n<code>WHATSAPP 1.20</code>", parse_mode="HTML")
     elif state == "wd_amount":
+        if not wd_open():
+            ctx.user_data.pop("state", None)
+            return await update.message.reply_text(tr(u, "wd_closed"))
         try:
             amt = float(text)
             assert MIN_WITHDRAW <= amt <= MAX_WITHDRAW and amt <= u["balance"]
@@ -764,6 +1120,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.update(state="wd_number", wd_amount=amt)
         await update.message.reply_text(tr(u, "wd_number"))
     elif state == "wd_number":
+        if not wd_open():
+            ctx.user_data.pop("state", None)
+            return await update.message.reply_text(tr(u, "wd_closed"))
         num = text.replace(" ", "")
         if not re.fullmatch(r"01\d{9}", num):
             return await update.message.reply_text(tr(u, "wd_bad_number"))
@@ -817,17 +1176,24 @@ def traffic_kb():
         rows.append([InlineKeyboardButton("👀 OTP Group", url=OTP_GROUP_LINK, api_kwargs={"style": "success"})])
     return InlineKeyboardMarkup(rows)
 
+async def language_cmd(update, ctx):
+    u = await gate(update, ctx)
+    if u:
+        await do_action(update, ctx, u, "lang")
+
 async def do_action(update, ctx, u, action):
     uid = update.effective_user.id
     m = update.message
     if action == "get":
         kb = [[eb(sv, sv, callback_data=f"svc:{sv}")] for sv in SERVICES]     # one per row, with emoji icon
         await m.reply_text(tr(u, "pick_service"), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+    elif action == "search":
+        ctx.user_data["state"] = "search"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(u, "search_cancel"), callback_data="search_cancel")]])
+        await m.reply_text(tr(u, "search_prompt"), parse_mode="HTML", reply_markup=kb)
     elif action == "traffic":
-        top = sorted(db["users"].items(), key=lambda kv: kv[1]["otps"], reverse=True)[:10]
-        medals = ["🥇", "🥈", "🥉"] + ["🏅"] * 7
-        lines = [f"{medals[i]} {esc(x['name'][:15])} — <code>{x['otps']}</code>" for i, (_, x) in enumerate(top)]
-        await m.reply_text(tr(u, "board") + "\n".join(lines), parse_mode="HTML")
+        text, kb = lb_view(u, "all")
+        await m.reply_text(text, parse_mode="HTML", reply_markup=kb)
     elif action == "live":
         await m.reply_text(traffic_text(u), parse_mode="HTML", reply_markup=traffic_kb())
     elif action == "profile":
@@ -849,6 +1215,8 @@ async def do_action(update, ctx, u, action):
     elif action == "admin" and is_admin(uid):
         rows = [[InlineKeyboardButton("📊 Stats", callback_data="adm:stats")],
                 [InlineKeyboardButton("💸 Pending withdrawals", callback_data="adm:pend")],
+                [InlineKeyboardButton(wd_btn_text(), callback_data="adm:wdtoggle")],
+                [InlineKeyboardButton("✏️ Edit texts & buttons", callback_data="adm:txt")],
                 [InlineKeyboardButton("💵 OTP Rates", callback_data="adm:rates")],
                 [InlineKeyboardButton(f"🔢 Numbers per request: {get_npr()}", callback_data="adm:npr")]]
         rows += [[InlineKeyboardButton(f"➕ Add numbers: {sv} ({len(db['pools'].get(sv, []))})",
@@ -856,6 +1224,7 @@ async def do_action(update, ctx, u, action):
         rows.append([InlineKeyboardButton("🗑 Remove numbers", callback_data="adm:rmmenu")])
         rows.append([InlineKeyboardButton("🆕 New service", callback_data="adm:newsvc"),
                      InlineKeyboardButton("🗑 Remove service", callback_data="adm:delmenu")])
+        rows.append([InlineKeyboardButton("✏️ Rename service", callback_data="adm:renmenu")])
         await m.reply_text("⚙️ <b>ADMIN PANEL</b>\n\nTap <b>➕ Add numbers</b> for a service, then send a .txt/.csv file.\n"
                            "Or: /addnumbers SERVICE N1 N2…  (or name the file facebook.txt)\n"
                            "/addservice NAME  /delservice NAME  /delnumbers SERVICE N…  /delcountry SERVICE CODE  /setotpgroup  /testgroup  /clearnumbers SERVICE  /assign SERVICE\n"
@@ -881,7 +1250,7 @@ def scanning_text(u, country, sid, mins, nums, fmt):
     flag = PREFIXES.get(country_of(nums[0])[0], ("🌍", ""))[0] if nums else "🌍"
     return tr(u, "scanning", flag=flag, country=country, sid=sid, mins=mins)
 
-def batch_kb(u, sid, prefix, nums, fmt, first_num):
+def batch_kb(u, sid, prefix, nums, fmt, first_num, bid=None):
     """Keyboard: one copy button per number, then format / change / view / cancel."""
     mark = lambda k: ("✅ " if fmt == k else "") + tr(u, k)
     rows = []
@@ -892,7 +1261,7 @@ def batch_kb(u, sid, prefix, nums, fmt, first_num):
                                           api_kwargs={"style": "success"})])
     rows.append([eb(mark("cc"), "cc", callback_data=f"fmt:{first_num}:cc"),
                  eb(mark("nocc"), "nocc", callback_data=f"fmt:{first_num}:nocc")])
-    rows.append([eb(tr(u, "change"), "change", callback_data=f"chg:{sid}:{prefix}:{first_num}"),
+    rows.append([eb(tr(u, "change"), "change", callback_data=f"chg:{sid}:{prefix}:{first_num}" + (f":{bid}" if bid else "")),
                  view_btn(u, first_num)])
     rows.append([eb(tr(u, "cancel"), "cancel", callback_data=f"cancel:{first_num}")])
     return InlineKeyboardMarkup(rows)
@@ -905,7 +1274,7 @@ ACTIVE = {}   # number -> {"uid","sid","country","msg","task"}
 
 def persist_held(num, e):
     db["held"][num] = {"uid": e["uid"], "sid": e["sid"], "country": e["country"], "fmt": e["fmt"],
-                       "prefix": e["prefix"], "since": e["since"].isoformat()}
+                       "prefix": e["prefix"], "bid": e.get("bid"), "since": e["since"].isoformat()}
     save()
 
 def load_held():
@@ -914,12 +1283,33 @@ def load_held():
         if num in ACTIVE or h["uid"] not in db["users"]:
             continue
         ACTIVE[num] = {"uid": h["uid"], "sid": h["sid"], "country": h["country"], "fmt": h.get("fmt", "cc"),
-                       "prefix": h.get("prefix", ""), "msg": None, "moved": True, "count": 0, "task": None,
+                       "prefix": h.get("prefix", ""), "bid": h.get("bid"), "msg": None, "moved": True, "count": 0, "task": None,
                        "since": parse_time(h["since"]) or datetime.now(timezone.utc)}
     if db.get("held"):
         log.info("Loaded %s old numbers that still deliver OTPs", len(db["held"]))
 
-async def allocate(update, ctx, u, sid, prefix, replace=None):
+def find_search_matches(query):
+    """Return {service: [numbers...]} for free numbers matching the search prefix.
+    Matches both full international form (88018...) and local form (018...)."""
+    q = re.sub(r"\D", "", str(query or ""))
+    if not (3 <= len(q) <= 9):
+        return {}
+    by_svc = {}
+    for sid, pool in db.get("pools", {}).items():
+        for n in pool:
+            if n in ACTIVE:
+                continue
+            ok = n.startswith(q)
+            if not ok:
+                for p in sorted(PREFIXES, key=len, reverse=True):
+                    if n.startswith(p) and n[len(p):].startswith(q):
+                        ok = True
+                        break
+            if ok:
+                by_svc.setdefault(sid, []).append(n)
+    return by_svc
+
+async def allocate(update, ctx, u, sid, prefix, replace=None, bid=None):
     """Gives get_npr() numbers together in ONE message with stacked number buttons.
     Change Number releases the whole batch and allocates a fresh set into the same message."""
     q = update.callback_query
@@ -948,20 +1338,28 @@ async def allocate(update, ctx, u, sid, prefix, replace=None):
                     e["task"] = None
                     persist_held(n, e)
     pool = db["pools"].setdefault(sid, [])
-    cands = [n for n in pool if n.startswith(prefix) and n not in ACTIVE]
+    label = db.get("batch_ids", {}).get(bid) if bid else None
+    # Search-mode Change Number (prefix is a 3–9 digit query, no batch): match by search prefix
+    if bid is None and prefix and prefix.isdigit() and 3 <= len(prefix) <= 9:
+        cands = [n for n in pool if n not in ACTIVE and (
+            n.startswith(prefix) or any(n.startswith(p) and n[len(p):].startswith(prefix)
+                                        for p in PREFIXES))]
+    else:
+        cands = [n for n in pool if n.startswith(prefix) and n not in ACTIVE and num_label(sid, n) == label]
     picks = random.sample(cands, min(get_npr(), len(cands)))
     if not picks:
-        target = old_msg or q.message
-        try:
-            await target.edit_text(tr(u, "no_numbers"), parse_mode="HTML")
-        except Exception:
-            pass
+        target = old_msg or (q.message if q else None)
+        if target:
+            try:
+                await target.edit_text(tr(u, "no_numbers"), parse_mode="HTML")
+            except Exception:
+                pass
         return
     fmt = u.get("numfmt", "cc")
     batch = str(time.time_ns())
     _, country = country_of(picks[0])
     text = scanning_text(u, country, sid, OTP_VALID_MINUTES, picks, fmt)
-    kb = batch_kb(u, sid, prefix, picks, fmt, picks[0])
+    kb = batch_kb(u, sid, prefix, picks, fmt, picks[0], bid)
     msg = None
     if old_msg:
         try:
@@ -970,27 +1368,86 @@ async def allocate(update, ctx, u, sid, prefix, replace=None):
         except Exception as ex:
             log.warning("edit failed: %s", ex)
     if msg is None:
-        try:
-            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
-            msg = q.message
-        except Exception:
-            msg = await q.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+        if q:
+            try:
+                await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+                msg = q.message
+            except Exception:
+                msg = await q.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            msg = await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb)
     for num in picks:
         pool.remove(num)
         u["nums"] += 1
         u["dn"] += 1
         _, country = country_of(num)
         entry = {"uid": uid, "sid": sid, "country": country, "msg": msg, "prefix": prefix, "fmt": fmt,
-                 "batch": batch, "nums": list(picks), "since": datetime.now(timezone.utc) - timedelta(seconds=30)}
+                 "batch": batch, "bid": bid, "nums": list(picks), "since": datetime.now(timezone.utc) - timedelta(seconds=30)}
         entry["task"] = None                  # no timer: the user keeps the number and is paid for every SMS on it
         ACTIVE[num] = entry
         persist_held(num, entry)              # saved, so it still works after a restart
+    save()
+
+async def allocate_from_search(update, ctx, u, query):
+    """Allocate numbers that match a user-typed search prefix (3–9 digits)."""
+    matches = find_search_matches(query)
+    if not matches:
+        await update.effective_message.reply_text(tr(u, "search_none", q=query), parse_mode="HTML")
+        return
+    # Prefer the service that has the most matching free numbers
+    sid = max(matches, key=lambda s: len(matches[s]))
+    cands = matches[sid]
+    picks = random.sample(cands, min(get_npr(), len(cands)))
+    pool = db["pools"].setdefault(sid, [])
+    uid = str(update.effective_user.id)
+    fmt = u.get("numfmt", "cc")
+    batch = str(time.time_ns())
+    _, country = country_of(picks[0])
+    text = scanning_text(u, country, sid, OTP_VALID_MINUTES, picks, fmt)
+    # Use the search query as prefix so "Change Number" keeps searching the same range
+    kb = batch_kb(u, sid, query, picks, fmt, picks[0], None)
+    msg = await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+    for num in picks:
+        if num in pool:
+            pool.remove(num)
+        u["nums"] += 1
+        u["dn"] += 1
+        _, country = country_of(num)
+        entry = {"uid": uid, "sid": sid, "country": country, "msg": msg, "prefix": query, "fmt": fmt,
+                 "batch": batch, "bid": None, "nums": list(picks),
+                 "since": datetime.now(timezone.utc) - timedelta(seconds=30), "task": None}
+        ACTIVE[num] = entry
+        persist_held(num, entry)
     save()
 
 def hide_code(otp):
     d = str(otp)
     k = max(0, min(OTP_PUBLIC_VISIBLE_DIGITS, len(d)))
     return d[:k] + "\u2022" * (len(d) - k)
+
+def local_time():
+    return datetime.now(timezone(timedelta(hours=TIMEZONE_HOURS))).strftime("%H:%M:%S")
+
+def holder_kb(otp=None, styled=True):
+    """Green copy button with the OTP; when the SMS has no code the button says N/A."""
+    st = {"api_kwargs": {"style": "success"}} if styled else {}
+    if otp:
+        return InlineKeyboardMarkup([[InlineKeyboardButton(f"🔑 {otp}", copy_text=CopyTextButton(text=str(otp)[:256]), **st)]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔑 N/A", callback_data="noop")]])
+
+async def send_holder(bot, e, text, otp=None):
+    """Send the OTP / SMS message (with its copy or N/A button) to the user who holds the number."""
+    for styled in (True, False):                   # if Telegram refuses the green colour, retry plain
+        kb = holder_kb(otp, styled)
+        try:
+            # Always send as a new message so the batch allocation message (with all numbers) stays visible
+            if e.get("moved") or e.get("msg") is None:
+                await bot.send_message(int(e["uid"]), text, parse_mode="HTML", reply_markup=kb)
+            else:
+                await e["msg"].reply_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+        except Exception as ex:
+            log.warning("send failed: %s", ex)
 
 async def complete(ctx, num, otp, cli=None):
     """Forward an OTP to the user who holds `num`. The number stays active until its timer ends,
@@ -1007,20 +1464,14 @@ async def complete(ctx, num, otp, cli=None):
         u["balance"] += rate
         u["otps"] += 1
         u["do"] += 1
+        count_hour(u)
     db["traffic"].append({"t": datetime.now(timezone.utc).isoformat(), "sid": e["sid"], "num": num})
     cut = datetime.now(timezone.utc) - timedelta(minutes=max(TRAFFIC_MINUTES, 15) + 15)
     db["traffic"] = [x for x in db["traffic"] if (parse_time(x.get("t")) or cut) >= cut]   # drop old entries
     save()
     text = tr(u, "success", country=e["country"], sid=e["sid"], num=fmt_num(num, e["fmt"]),
-              otp=esc(otp), rate=rate)
-    try:
-        # Always send OTP as a new message so the batch allocation message (with all numbers) stays visible
-        if e.get("moved") or e.get("msg") is None:
-            await ctx.bot.send_message(int(e["uid"]), text, parse_mode="HTML")
-        else:
-            await e["msg"].reply_text(text, parse_mode="HTML")
-    except Exception as ex:
-        log.warning("send failed: %s", ex)
+              otp=esc(otp), rate=rate, time=local_time())
+    await send_holder(ctx.bot, e, text, otp)
     await post_public(ctx, e, num, otp, cli)
 
 def public_text(e, num, otp, cli=None):
@@ -1035,6 +1486,25 @@ def public_text(e, num, otp, cli=None):
     lines += [f"🔑 Code: <code>{esc(hide_code(otp))}</code>", f"🕒 {now}"]
     return "\n".join(lines)
 
+def group_kb(bot, styled=True):
+    """Two buttons under EVERY post in the public OTP group: Number Bot -> the bot, Method -> the channel."""
+    row = []
+    if bot.username:
+        row.append(InlineKeyboardButton("🤖 Number Bot", url=f"https://t.me/{bot.username}",
+                                        **({"api_kwargs": {"style": "danger"}} if styled else {})))
+    if CHANNEL_LINK:
+        row.append(InlineKeyboardButton("🔥 Method", url=CHANNEL_LINK,
+                                        **({"api_kwargs": {"style": "primary"}} if styled else {})))
+    return InlineKeyboardMarkup([row]) if row else None
+
+async def send_group(bot, text):
+    """Post to the public OTP group with the 2 buttons (falls back to plain buttons if Telegram rejects the colours)."""
+    try:
+        return await bot.send_message(OTP_GROUP_ID, text, parse_mode="HTML", reply_markup=group_kb(bot))
+    except Exception as ex:
+        log.warning("group post with coloured buttons failed (%s), retrying plain", type(ex).__name__)
+        return await bot.send_message(OTP_GROUP_ID, text, parse_mode="HTML", reply_markup=group_kb(bot, styled=False))
+
 async def post_public(ctx, e, num, otp, cli=None):
     if not OTP_GROUP_ID:
         return                                # no public group set yet (/setotpgroup)
@@ -1042,7 +1512,7 @@ async def post_public(ctx, e, num, otp, cli=None):
         log.warning("OTP_GROUP_ID is the same as SOURCE_GROUP_ID: public post skipped")
         return
     try:
-        await ctx.bot.send_message(OTP_GROUP_ID, public_text(e, num, otp, cli), parse_mode="HTML")
+        await send_group(ctx.bot, public_text(e, num, otp, cli))
     except Exception as ex:
         log.warning("public OTP group post FAILED (%s): %s. Is the bot admin in the group and OTP_GROUP_ID correct?",
                     type(ex).__name__, ex)
@@ -1082,19 +1552,16 @@ async def forward_text(app, num, text, cli, e):
             u["balance"] += rate
             u["otps"] += 1
             u["do"] += 1
+            count_hour(u)
         db["traffic"].append({"t": datetime.now(timezone.utc).isoformat(), "sid": e["sid"], "num": num})
         cut = datetime.now(timezone.utc) - timedelta(minutes=max(TRAFFIC_MINUTES, 15) + 15)
         db["traffic"] = [x for x in db["traffic"] if (parse_time(x.get("t")) or cut) >= cut]
         save()
-        body = (f"📩 <b>SMS received</b>\n🌍 {esc(e['country'])} · {esc(e['sid'])}\n"
-                f"📟 <code>+{esc(num)}</code>\n"
+        body = (f"{esc(e['country'])} · <b>{esc(e['sid'])}</b>\n"
+                f"📟 <code>{esc(fmt_num(num, e['fmt']))}</code>\n"
                 + (f"📨 Sender: {esc(cli)}\n" if cli else "")
-                + f"\n{esc(text or '')}"
-                + (f"\n\n💰 +{rate}" if rate else ""))
-        try:
-            await app.bot.send_message(int(e["uid"]), body, parse_mode="HTML")
-        except Exception as ex:
-            log.warning("send failed: %s", ex)
+                + f"🕒 {local_time()}\n💵 +{rate} BDT\n\n{esc((text or '')[:800])}")
+        await send_holder(app.bot, e, body, None)
     if not OTP_GROUP_ID or OTP_GROUP_ID == SOURCE_GROUP_ID:
         return
     sid = e["sid"] if e else guess_service(cli, text)
@@ -1106,7 +1573,7 @@ async def forward_text(app, num, text, cli, e):
         lines.append(f"📨 Sender: {esc(cli)}")
     lines += [f"💬 {esc((text or '')[:800])}", f"🕒 {now}"]
     try:
-        await app.bot.send_message(OTP_GROUP_ID, "\n".join(lines), parse_mode="HTML")
+        await send_group(app.bot, "\n".join(lines))
     except Exception as ex:
         log.warning("public group post FAILED (%s): %s", type(ex).__name__, ex)
 
@@ -1118,9 +1585,15 @@ def guess_service(cli, text):
     for sid in SERVICES:
         if sid in s:
             return sid
-    for key, sid in (("FB", "FACEBOOK"), ("WHATS", "WHATSAPP"), ("INSTA", "INSTAGRAM"), ("TIK", "TIKTOK")):
-        if key in s and sid in SERVICES:
+    for sid in sorted(SERVICES, key=lambda x: -len(svc_base(x))):
+        b = svc_base(sid)
+        if len(b) >= 2 and b in s:
             return sid
+    for key, base in (("FB", "FACEBOOK"), ("WHATS", "WHATSAPP"), ("INSTA", "INSTAGRAM"), ("TIK", "TIKTOK")):
+        if key in s:
+            for sid in SERVICES:
+                if svc_base(sid) == base:
+                    return sid
     return "OTHER"
 
 async def api_check(app):
@@ -1273,6 +1746,15 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not data.startswith(("vo:", "copy:")):
         await q.answer()
 
+    if data == "noop":
+        return
+    if data == "search_cancel":
+        ctx.user_data.pop("state", None)
+        try:
+            await q.message.edit_text("✅ Search cancelled.")
+        except Exception:
+            pass
+        return
     # admin-only callbacks
     if data.startswith(("wda:", "wdr:", "adm:")):
         if not is_admin(uid):
@@ -1399,7 +1881,20 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if data == "adm:newsvc":
             ctx.user_data["state"] = "newsvc"
             return await q.message.reply_text(
-                "✏️ Send the new service name (example: AGODA, IMO, GOOGLE).\nLetters/numbers, 2-20 characters.")
+                "✏️ Send the new service name (example: AGODA, IMO🙂, FACEBOOK🔥🔥).\nLetters/numbers/emoji, 2-20 characters.")
+        if data == "adm:renmenu":
+            kb = [[InlineKeyboardButton(f"✏️ {sv} ({len(db['pools'].get(sv, []))})", callback_data=f"adm:ren:{sv}")]
+                  for sv in SERVICES]
+            return await q.message.reply_text("Which service do you want to rename?\n(All its numbers, rate and data are kept.)",
+                                              reply_markup=InlineKeyboardMarkup(kb))
+        if data.startswith("adm:ren:"):
+            sid = data[8:]
+            if sid not in SERVICES:
+                return await q.edit_message_text("Service not found.")
+            ctx.user_data.update(state="rensvc", rensvc=sid)
+            return await q.edit_message_text(
+                f"✏️ Send the new name for <b>{esc(sid)}</b> (example: FACEBOOK🔥🔥).\n"
+                "Letters/numbers/emoji, 2-20 characters.", parse_mode="HTML")
         if data == "adm:delmenu":
             kb = [[InlineKeyboardButton(f"🗑 {sv} ({len(db['pools'].get(sv, []))})", callback_data=f"adm:del:{sv}")]
                   for sv in SERVICES]
@@ -1429,6 +1924,49 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.message.reply_text(
                 f"📥 Now send the .txt/.csv file with numbers for <b>{sid}</b>.\n"
                 "Every file you send goes to this service until you pick another.", parse_mode="HTML")
+        if data == "adm:txt":
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(n, callback_data=f"adm:txl:{lg}:0")]
+                                       for lg, n in LANG_NAMES.items()])
+            return await q.message.reply_text("✏️ Which language do you want to edit?", reply_markup=kb)
+        if data.startswith("adm:txl:"):
+            _, _, lang, page = data.split(":")
+            kb, p, pages = texts_page_kb(lang, int(page))
+            txt = f"✏️ {LANG_NAMES.get(lang, lang)} — tap a text to edit (page {p}/{pages}). ✏️ = already edited."
+            try:
+                return await q.edit_message_text(txt, reply_markup=kb)
+            except Exception:
+                return await q.message.reply_text(txt, reply_markup=kb)
+        if data.startswith(("adm:txk:", "adm:txr:")):
+            _, kind, lang, key = data.split(":", 3)
+            if lang not in T or key not in T[lang]:
+                return
+            if kind == "txr":
+                db.get("texts", {}).get(lang, {}).pop(key, None)
+                save()
+                await q.message.reply_text(f"♻️ {key} reset to the default.")
+            allowed = fields_of(T[lang][key])
+            ctx.user_data.update(state="txtedit", tx_lang=lang, tx_key=key)
+            how = ("Plain text, one line, max 40 characters. Emoji are fine." if key in PLAIN_KEYS else
+                   "You can use HTML: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;, &lt;code&gt;code&lt;/code&gt;.")
+            ph = ("Placeholders (keep them as they are): " + ", ".join("<code>{" + a + "}</code>" for a in allowed)) if allowed else "No placeholders."
+            rows = [[InlineKeyboardButton("🔙 Back to list", callback_data=f"adm:txl:{lang}:0")]]
+            if db.get("texts", {}).get(lang, {}).get(key):
+                rows.insert(0, [InlineKeyboardButton("♻️ Reset to default", callback_data=f"adm:txr:{lang}:{key}")])
+            return await q.message.reply_text(
+                f"✏️ <b>{esc(key)}</b> ({LANG_NAMES.get(lang, lang)})\n\nCurrent text:\n<pre>{esc(text_now(lang, key))}</pre>\n"
+                f"{ph}\n{how}\n\nSend the new text now.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        if data == "adm:wdtoggle":
+            db.setdefault("settings", {})["wd_on"] = not wd_open()
+            save()
+            try:
+                rows = [[InlineKeyboardButton(wd_btn_text(), callback_data="adm:wdtoggle")
+                         if b.callback_data == "adm:wdtoggle" else b for b in row]
+                        for row in q.message.reply_markup.inline_keyboard]
+                await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+            except Exception:
+                pass
+            return await q.message.reply_text("💸 Withdraw is now " + ("ON ✅ users can withdraw." if wd_open()
+                                                                     else "OFF ⛔ users cannot withdraw."))
         if data == "adm:pend":
             pend = {k: v for k, v in db["withdraws"].items() if v["status"] == "pending"}
             if not pend:
@@ -1445,8 +1983,11 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.edit_message_text("Already handled.")
         target = db["users"][w["uid"]]
         if data.startswith("wda:"):
-            w["status"] = "paid"
-            note = "wd_paid"
+            # Paid: ask for the payment photo; the user will see it in the bot
+            ctx.user_data.update(state="wdproof", wdproof=wid)
+            return await q.message.reply_text(
+                f"📸 Send the payment screenshot for #{wid} ({w['method']} {w['number']}, {w['amount']} BDT) as a photo.\n"
+                "The user will see it in the bot.\nOr send - to mark it Paid without a photo.")
         else:
             w["status"] = "rejected"
             target["balance"] += w["amount"]
@@ -1483,19 +2024,32 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         counts = {}
         for n in db["pools"].get(sid, []):
             p, _ = country_of(n)
-            counts[p] = counts.get(p, 0) + 1
+            key = (p, num_label(sid, n))
+            counts[key] = counts.get(key, 0) + 1
         if not counts:
             return await q.edit_message_text(tr(u, "no_numbers"), parse_mode="HTML")
         btns = []
-        for p, c in sorted(counts.items(), key=lambda kv: -kv[1]):
-            label = f"{PREFIXES[p][0]} {PREFIXES[p][1]} ({c})" if p in PREFIXES else f"🌍 Other ({c})"
-            btns.append(InlineKeyboardButton(label, callback_data=f"cty:{sid}:{p}"))
+        for (p, lab), c in sorted(counts.items(), key=lambda kv: -kv[1]):
+            flag = PREFIXES[p][0] if p in PREFIXES else "🌍"
+            if lab:
+                label = f"{flag} {lab} ({c})"
+            else:
+                label = f"{PREFIXES[p][0]} {PREFIXES[p][1]} ({c})" if p in PREFIXES else f"🌍 Other ({c})"
+            btns.append(InlineKeyboardButton(label, callback_data=f"cty:{sid}:{p}" + (f":{label_id(lab)}" if lab else "")))
         rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
         await q.edit_message_text(tr(u, "pick_country", sid=sid), parse_mode="HTML",
                                   reply_markup=InlineKeyboardMarkup(rows))
     elif data.startswith(("cty:", "chg:")):
         kind, sid, prefix, *rest = data.split(":")
-        await allocate(update, ctx, u, sid, prefix, replace=rest[0] if (kind == "chg" and rest) else None)
+        if sid not in SERVICES:
+            return await q.message.reply_text(tr(u, "no_numbers"), parse_mode="HTML")
+        if kind == "chg":
+            replace = rest[0] if rest else None
+            bid = rest[1] if len(rest) > 1 else None
+        else:
+            replace = None
+            bid = rest[0] if rest else None
+        await allocate(update, ctx, u, sid, prefix, replace=replace, bid=bid or None)
     elif data.startswith("fmt:"):
         _, num, fmt = data.split(":")
         u["numfmt"] = fmt
@@ -1508,7 +2062,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if n in ACTIVE and ACTIVE[n].get("batch") == batch:
                     ACTIVE[n]["fmt"] = fmt
             text = scanning_text(u, e["country"], e["sid"], OTP_VALID_MINUTES, nums, fmt)
-            kb = batch_kb(u, e["sid"], e["prefix"], nums, fmt, nums[0])
+            kb = batch_kb(u, e["sid"], e["prefix"], nums, fmt, nums[0], e.get("bid"))
             try:
                 await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
             except Exception:
@@ -1550,13 +2104,23 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     ent["task"].cancel()
                 db["held"].pop(n, None)
         await q.edit_message_text(tr(u, "cancelled"))
+    elif data.startswith("lb:"):
+        text, kb = lb_view(u, data[3:])
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass                                   # same tab tapped again: nothing to change
     elif data == "wd":
+        if not wd_open():
+            return await q.message.reply_text(tr(u, "wd_closed"))
         if u["balance"] < MIN_WITHDRAW:
             return await q.message.reply_text(tr(u, "wd_min", bal=u["balance"], m=MIN_WITHDRAW), parse_mode="HTML")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌸 bKash", callback_data="wdm:bKash"),
                                     InlineKeyboardButton("🍊 Nagad", callback_data="wdm:Nagad")]])
         await q.message.reply_text(tr(u, "wd_gateway"), reply_markup=kb)
     elif data.startswith("wdm:"):
+        if not wd_open():
+            return await q.message.reply_text(tr(u, "wd_closed"))
         ctx.user_data.update(state="wd_amount", wd_method=data[4:])
         await q.message.reply_text(tr(u, "wd_amount", mn=MIN_WITHDRAW, mx=MAX_WITHDRAW))
 
@@ -1564,6 +2128,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("language", language_cmd))
     app.add_handler(CommandHandler("addnumbers", addnumbers))
     app.add_handler(CommandHandler("setemoji", setemoji))
     app.add_handler(CommandHandler("backup", backup_cmd))
@@ -1572,6 +2137,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_cb))
     if SMS_SOURCE == "group":
         app.add_handler(MessageHandler(filters.Chat(SOURCE_GROUP_ID) & (filters.TEXT | filters.CAPTION), on_source), group=-1)
+    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, on_photo))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
     log.info("Bot started")
