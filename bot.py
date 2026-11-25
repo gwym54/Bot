@@ -1,3 +1,4 @@
+print("=== NEW BOT CODE LOADED - VERSION 2026-11-26 ===")
 """
 Telegram number/OTP bot (python-telegram-bot v20+).
 
