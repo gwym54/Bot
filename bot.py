@@ -16,7 +16,6 @@ Teleroutex -> Telegram group mode (SMS_SOURCE=group, default):
     3. export SOURCE_GROUP_ID=-100xxxxxxxxxx   (use a different OTP_GROUP_ID for public posts)
 """
 import asyncio
-import hashlib
 import html
 import json
 import logging
@@ -52,10 +51,6 @@ MESSAGES_URL = os.environ.get("MESSAGES_URL", "")
 # API mode (SMS_SOURCE=api): either set TELEROUTEX_API_KEY (recommended) or a full MESSAGES_URL
 TELEROUTEX_API_KEY = os.environ.get("TELEROUTEX_API_KEY", "").strip()
 TELEROUTEX_URL = os.environ.get("TELEROUTEX_URL", "https://server.teleroutex.com/api/message-data-record/viewstats")
-# Second SMS panel: IMS SMS. Only the token goes in Railway Variables (IMS_API_TOKEN); empty = this panel is not used.
-IMS_API_TOKEN = os.environ.get("IMS_API_TOKEN", "").strip()
-IMS_API_URL = "https://imssms.org/api/v1/messages"
-IMS_LIMIT = 100                                    # newest messages fetched per check (panel allows up to 500)
 if SMS_SOURCE == "api" and not (MESSAGES_URL or TELEROUTEX_API_KEY):
     raise SystemExit("SMS_SOURCE=api needs TELEROUTEX_API_KEY (or MESSAGES_URL) to be set")
 ADMINS = [int(x) for x in os.environ.get("ADMINS", "").split(",") if x.strip()]
@@ -616,59 +611,13 @@ def country_of(num):
 
 # ==================== OTP API ====================
 # Response shape: {"data": {"docs": [{"_id","number","cli","message","createdAt"}, ...]}}, newest first
-async def fetch_teleroutex():
+async def fetch_records():
     base = MESSAGES_URL or (TELEROUTEX_URL + "?" + urlencode({"apiKey": TELEROUTEX_API_KEY}))
     url = base + ("&" if "?" in base else "?") + "page=1"
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.get(url)
         r.raise_for_status()
         return r.json().get("data", {}).get("docs", [])
-
-# IMS SMS response: {"records": [{"time", "cli", "number", "content", "range", "payout", "status"}, ...]}, newest first.
-# It has no id, so one is made from the record itself. Records are converted to the Teleroutex shape.
-def ims_to_record(r):
-    key = "|".join(str(r.get(k, "")) for k in ("time", "number", "cli", "content"))
-    return {"_id": "ims:" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:20],
-            "number": r.get("number", ""), "cli": r.get("cli"),
-            "message": r.get("content", ""), "createdAt": r.get("time", "")}
-
-async def fetch_ims():
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get(IMS_API_URL, params={"limit": IMS_LIMIT},
-                        headers={"Authorization": f"Bearer {IMS_API_TOKEN}"})   # token in a header: never in a URL or log
-        r.raise_for_status()
-        return [ims_to_record(x) for x in r.json().get("records", [])]
-
-_panel_ready = set()
-
-async def _fetch_panel(name, fn):
-    """One panel. Its first successful check only remembers the old SMS (nothing old is forwarded)."""
-    recs = await fn()
-    if name not in _panel_ready:
-        _panel_ready.add(name)
-        for rec in recs:
-            seen_ids.add(rec.get("_id"))
-        log.info("%s connected: %s recent SMS in the panel (not forwarded)", name, len(recs))
-        return []
-    return recs
-
-async def fetch_records():
-    """All panels together. If one panel fails the other keeps working."""
-    panels = [("Teleroutex", fetch_teleroutex)] + ([("IMS SMS", fetch_ims)] if IMS_API_TOKEN else [])
-    results = await asyncio.gather(*(_fetch_panel(n, f) for n, f in panels), return_exceptions=True)
-    out, failed = [], []
-    for (name, _), res in zip(panels, results):
-        if isinstance(res, Exception):
-            failed.append(res)
-            code = getattr(getattr(res, "response", None), "status_code", "")
-            log.warning("%s poll failed: %s %s", name, type(res).__name__, code)   # no URL/token in the message
-        else:
-            out += res
-    if failed and len(failed) == len(panels):
-        raise failed[0]                       # every panel failed
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    out.sort(key=lambda r: parse_time(r.get("createdAt", "")) or epoch, reverse=True)   # newest first
-    return out
 
 OTP_RE = re.compile(r"(?<!\d)(\d{3}[- ]\d{3}|\d{4,8})(?!\d)")
 OTP_LONG_RE = re.compile(r"(?<!\d)(\d{4,10})(?!\d)")
@@ -1692,7 +1641,7 @@ async def api_check(app):
 
 async def api_poller(app):
     """API mode: ONE request every POLL_SECONDS for all waiting numbers."""
-    log.info("API mode: checking Teleroutex%s every %ss", " + IMS SMS" if IMS_API_TOKEN else "", POLL_SECONDS)
+    log.info("API mode: checking Teleroutex every %ss", POLL_SECONDS)
     while True:
         await asyncio.sleep(POLL_SECONDS)
         try:
