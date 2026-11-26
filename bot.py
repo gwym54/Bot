@@ -1,20 +1,20 @@
-print("=== NEW BOT CODE LOADED - VERSION 2026-11-26 ===")
 """
-Telegram number/OTP bot (python-telegram-bot v20+).
+OTP Bot – Version 2.0
+Telegram number / OTP bot (python-telegram-bot v20+)
+
+API Mode (Railway Ready) – polls Teleroutex / IMS SMS for OTPs.
 
 Setup:
     pip install "python-telegram-bot>=20" httpx pyotp
     export BOT_TOKEN="..."            # from @BotFather
-    export MESSAGES_URL="<Teleroutex endpoint that returns received SMS, with ?apiKey=NEW_KEY>"
-    export ADMINS="123456789"         # comma separated
+    export ADMINS="123456789"         # comma separated Telegram user IDs
+    export CHANNEL_ID="-100..."
+    export CHANNEL_LINK="https://t.me/yourchannel"
+    export TELEROUTEX_API_KEY="..."   # or full MESSAGES_URL
     python bot.py
 
-Admin adds numbers by sending a .txt file (one number per line) to the bot
-or with /addnumbers 2371234567 2379876543
-Teleroutex -> Telegram group mode (SMS_SOURCE=group, default):
-    1. Create a group (or channel), set Teleroutex to forward SMS into it.
-    2. Add this bot to it (as admin for a channel; admin or privacy-mode off for a group).
-    3. export SOURCE_GROUP_ID=-100xxxxxxxxxx   (use a different OTP_GROUP_ID for public posts)
+Admin adds numbers by sending a .txt / .csv file (one number per line)
+or with: /addnumbers SERVICE 8801xxxxxxx 8801yyyyyyy
 """
 import asyncio
 import hashlib
@@ -28,66 +28,103 @@ import string
 import time
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 import httpx
 import pyotp
-from urllib.parse import urlencode
-from telegram import (CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup,
-                      ReplyKeyboardMarkup, Update)
-from telegram.ext import (ApplicationBuilder, CallbackQueryHandler,
-                          CommandHandler, ContextTypes, MessageHandler, filters)
+from telegram import (
+    CopyTextButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-logging.basicConfig(level=logging.INFO)
-# httpx logs full request URLs (bot token / API key) at INFO level: keep them out of the console
+# ==================== VERSION ====================
+VERSION = "2.0"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+# httpx logs full request URLs (bot token / API key) at INFO – keep them out
 for _n in ("httpx", "httpcore"):
     logging.getLogger(_n).setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
+print("=== NEW BOT CODE LOADED - VERSION 2.0 ===")
+log.info("=== NEW BOT CODE LOADED - VERSION %s ===", VERSION)
+
 # ==================== CONFIG ====================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-# SMS_SOURCE=group : Teleroutex forwards SMS into a Telegram group/channel (SOURCE_GROUP_ID); bot reads it
-# SMS_SOURCE=api   : bot polls MESSAGES_URL instead
+
+# SMS_SOURCE = "api"  → poll Teleroutex / IMS API
+# SMS_SOURCE = "group" → read SMS from SOURCE_GROUP_ID
 SMS_SOURCE = os.environ.get("SMS_SOURCE", "api")
 SOURCE_GROUP_ID = int(os.environ.get("SOURCE_GROUP_ID", "0"))
 MESSAGES_URL = os.environ.get("MESSAGES_URL", "")
-# API mode (SMS_SOURCE=api): either set TELEROUTEX_API_KEY (recommended) or a full MESSAGES_URL
+
+# Teleroutex panel (API mode)
 TELEROUTEX_API_KEY = os.environ.get("TELEROUTEX_API_KEY", "").strip()
-TELEROUTEX_URL = os.environ.get("TELEROUTEX_URL", "https://server.teleroutex.com/api/message-data-record/viewstats")
-# Second SMS panel: IMS SMS. Only the token goes in Railway Variables (IMS_API_TOKEN); empty = this panel is not used.
+TELEROUTEX_URL = os.environ.get(
+    "TELEROUTEX_URL",
+    "https://server.teleroutex.com/api/message-data-record/viewstats",
+)
+
+# Optional second panel: IMS SMS (leave IMS_API_TOKEN empty to disable)
 IMS_API_TOKEN = os.environ.get("IMS_API_TOKEN", "").strip()
 IMS_API_URL = "https://imssms.org/api/v1/messages"
-IMS_LIMIT = 100                                    # newest messages fetched per check (panel allows up to 500)
+IMS_LIMIT = 100
+
 if SMS_SOURCE == "api" and not (MESSAGES_URL or TELEROUTEX_API_KEY):
     raise SystemExit("SMS_SOURCE=api needs TELEROUTEX_API_KEY (or MESSAGES_URL) to be set")
+
 ADMINS = [int(x) for x in os.environ.get("ADMINS", "").split(",") if x.strip()]
 if not ADMINS:
     raise SystemExit("ADMINS is empty: set your Telegram user ID in .env")
+
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 CHANNEL_LINK = os.environ["CHANNEL_LINK"]
+
+
 def _int(v):
     try:
         return int(str(v).strip())
     except ValueError:
         return 0
-OTP_GROUP_ID = _int(os.environ.get("OTP_GROUP_ID", "-1004468430746"))   # public OTP group (default in the program; /setotpgroup can change it)
-# Force join: users must be in the channel above AND in the public OTP group. Fixed in the program, no variable needed.
-FORCE_GROUP_LINK = ""   # optional: paste the OTP group invite link here. Empty = the bot reads/creates one itself
+
+
+# Public OTP group (can be changed later with /setotpgroup)
+OTP_GROUP_ID = _int(os.environ.get("OTP_GROUP_ID", "-1004468430746"))
+FORCE_GROUP_LINK = ""  # optional hard-coded invite link; empty = bot creates/reads one
 SUPPORT_LINK = os.environ.get("SUPPORT_LINK", CHANNEL_LINK)
-# invite link of the public OTP group: the View OTP button opens it directly
 OTP_GROUP_LINK = os.environ.get("OTP_GROUP_LINK", "").strip()
 DEVELOPER_LINK = os.environ.get("DEVELOPER_LINK", SUPPORT_LINK)
-TRAFFIC_MINUTES = int(os.environ.get("TRAFFIC_MINUTES", "15"))                                 # window of the Traffic report
-TIMEZONE_HOURS = float(os.environ.get("TIMEZONE_HOURS", "6"))   # time shown in the public group (6 = Bangladesh)
+
+TRAFFIC_MINUTES = int(os.environ.get("TRAFFIC_MINUTES", "15"))
+TIMEZONE_HOURS = float(os.environ.get("TIMEZONE_HOURS", "6"))  # 6 = Bangladesh
 OTP_RATE = float(os.environ.get("OTP_RATE", "0.80"))
-# every OTP that arrives while the user holds the number is forwarded; 1 = pay for each, 0 = pay only the first
-PAY_EVERY_OTP = True   # fixed: the user is paid for every OTP / SMS received on the held number
-# public OTP group: how many leading digits of the code stay visible (0 = fully hidden)
-OTP_PUBLIC_VISIBLE_DIGITS = 99   # fixed: the OTP code is fully visible in the public group (the number stays masked)
+
+# Pay for every OTP/SMS received on a held number
+PAY_EVERY_OTP = True
+
+# How many leading digits of the OTP stay visible in the public group (99 = fully visible)
+OTP_PUBLIC_VISIBLE_DIGITS = 99
+
 REFERRAL_PRICE = 0
 MIN_WITHDRAW, MAX_WITHDRAW = 50, 10000
-NUMBERS_PER_REQUEST = int(os.environ.get("NUMBERS_PER_REQUEST", "3"))   # numbers given per GET NUMBER tap
-OTP_VALID_MINUTES = int(os.environ.get("OTP_VALID_MINUTES", "10"))       # how long each number waits for its OTP
-KEEP_OLD_MINUTES = 0   # fixed: no timer          # after Change Number, old numbers deliver OTPs this long (0 = no time limit)
+NUMBERS_PER_REQUEST = int(os.environ.get("NUMBERS_PER_REQUEST", "3"))
+OTP_VALID_MINUTES = int(os.environ.get("OTP_VALID_MINUTES", "10"))
+KEEP_OLD_MINUTES = 0          # after Change Number, old numbers still deliver OTPs (0 = forever)
 POLL_SECONDS, POLL_TIMEOUT = 5, OTP_VALID_MINUTES * 60
 DB_FILE = os.environ.get("DB_FILE", "db.json")
 
@@ -1692,15 +1729,18 @@ async def api_check(app):
             await post_public(app, fake, num, m.group(1), cli)
 
 async def api_poller(app):
-    """API mode: ONE request every POLL_SECONDS for all waiting numbers."""
-    log.info("API mode: checking Teleroutex%s every %ss", " + IMS SMS" if IMS_API_TOKEN else "", POLL_SECONDS)
+    """API mode: poll all panels every POLL_SECONDS. Both Teleroutex + IMS run together."""
+    panels = ["Teleroutex"]
+    if IMS_API_TOKEN:
+        panels.append("IMS SMS")
+    log.info("API mode: dual-panel ready → %s  |  poll every %ss", " + ".join(panels), POLL_SECONDS)
     while True:
         await asyncio.sleep(POLL_SECONDS)
         try:
             await api_check(app)
         except Exception as ex:
             code = getattr(getattr(ex, "response", None), "status_code", "")
-            log.warning("otp poll failed: %s %s", type(ex).__name__, code)   # no URL in the message: it contains the key
+            log.warning("otp poll failed: %s %s", type(ex).__name__, code)
 
 async def check_otp_group(app):
     if not OTP_GROUP_ID:
@@ -1744,7 +1784,13 @@ async def backup_loop(app):
 async def post_init(app):
     load_held()
     await check_otp_group(app)
-    log.info("Started: SMS_SOURCE=%s, OTP_GROUP_ID=%s, DB_FILE=%s", SMS_SOURCE, OTP_GROUP_ID, DB_FILE)
+
+    panels = "Teleroutex"
+    if IMS_API_TOKEN:
+        panels += " + IMS SMS"
+    log.info("=== BOT v%s READY === SMS_SOURCE=%s | Panels: %s | OTP_GROUP_ID=%s",
+             VERSION, SMS_SOURCE, panels, OTP_GROUP_ID)
+
     if BACKUP_HOURS > 0:
         app.bot_data["backup"] = asyncio.create_task(backup_loop(app))
     if SMS_SOURCE == "api":
@@ -2178,22 +2224,51 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ==================== MAIN ====================
 def main():
+    print("=== NEW BOT CODE LOADED - VERSION 2.0 ===")
+    log.info("=== STARTING BOT v%s ===", VERSION)
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("language", language_cmd))
     app.add_handler(CommandHandler("addnumbers", addnumbers))
     app.add_handler(CommandHandler("setemoji", setemoji))
     app.add_handler(CommandHandler("backup", backup_cmd))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Entity("custom_emoji"), emoji_ids), group=-2)
-    app.add_handler(CommandHandler(["ban", "unban", "addbal", "broadcast", "setrate", "rates", "clearnumbers", "assign", "addservice", "delservice", "delnumbers", "delcountry", "testgroup", "setotpgroup"], admin_cmds))
+    app.add_handler(CommandHandler(
+        ["ban", "unban", "addbal", "broadcast", "setrate", "rates",
+         "clearnumbers", "assign", "addservice", "delservice",
+         "delnumbers", "delcountry", "testgroup", "setotpgroup"],
+        admin_cmds,
+    ))
+
+    # Custom emoji detector (admin only)
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.Entity("custom_emoji"), emoji_ids),
+        group=-2,
+    )
+
+    # Callbacks
     app.add_handler(CallbackQueryHandler(on_cb))
+
+    # Source group (only when SMS_SOURCE=group)
     if SMS_SOURCE == "group":
-        app.add_handler(MessageHandler(filters.Chat(SOURCE_GROUP_ID) & (filters.TEXT | filters.CAPTION), on_source), group=-1)
+        app.add_handler(
+            MessageHandler(
+                filters.Chat(SOURCE_GROUP_ID) & (filters.TEXT | filters.CAPTION),
+                on_source,
+            ),
+            group=-1,
+        )
+
+    # Private messages
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, on_photo))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
-    log.info("Bot started")
+
+    log.info("Bot v%s handlers registered – starting polling...", VERSION)
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
